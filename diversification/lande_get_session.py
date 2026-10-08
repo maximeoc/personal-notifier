@@ -63,8 +63,10 @@ the fetched data to the Sheet.
 """
 
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import logging
 
@@ -89,7 +91,7 @@ CHROME_CANDIDATES = [
     r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
     os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
 ]
-PROFILE_DIR = os.path.join(os.environ.get("TEMP", "."), "lande_get_session_chrome_profile")
+PROFILE_DIR = os.path.join(tempfile.gettempdir(), "lande_get_session_chrome_profile")
 
 LANDE_EMAIL = os.environ.get("LANDE_EMAIL")
 LANDE_PASSWORD = os.environ.get("LANDE_PASSWORD")
@@ -100,10 +102,14 @@ def _find_chrome() -> str:
     for path in CHROME_CANDIDATES:
         if os.path.exists(path):
             return path
+    for name in ("google-chrome", "google-chrome-stable"):
+        path = shutil.which(name)
+        if path:
+            return path
     raise RuntimeError(
-        f"Could not find chrome.exe in any of: {CHROME_CANDIDATES}. "
+        f"Could not find Chrome in any of: {CHROME_CANDIDATES} or on PATH (google-chrome). "
         "Install Google Chrome, or edit CHROME_CANDIDATES in this file "
-        "with your real chrome.exe path."
+        "with your real Chrome path."
     )
 
 
