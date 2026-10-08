@@ -520,19 +520,16 @@ def fill_current_month_amounts_with_labels(
 
 
 def fill_current_month_bonus_breakdown(platform: str, breakdown: dict, section: str = "Crowdlending"):
-    """Write this month's bonus/cashback/contest figures to their own
-    dedicated sub-rows under a platform's block, instead of the merged
-    "Bonus" row (which is a SUM formula over those sub-rows in the Sheet
-    itself - deliberately never written to here).
+    """Write this month's bonus/cashback/contest figures (now a single
+    "Bonus" row per platform) and the other labelled sub-rows (XIRR, Cash
+    drag, ...) under a platform's block.
 
     `breakdown` : dict mapping the exact sub-row label (case-insensitive,
     substring-matched, same convention as find_rows_by_texts_below) to the
-    amount to write, e.g. {"prime": 12.3} or {"cashback": 5.0} or, for
-    Bricks' differently-labelled block, {"parrainages": 1.0, "soldes
-    boostés": 2.0}. Only the labels present in `breakdown` are looked up/
-    written - a platform whose bonus feature maps to a single category
-    (the common case) only ever touches that one row, leaving the other
-    sibling rows (and "Bonus" itself) untouched.
+    amount to write, e.g. {"Bonus": 12.3}. The "Bonus" label is only
+    accepted on a row whose text is exactly "Bonus" (never "XIRR Bonus"
+    or similar). Only the labels present in `breakdown` are looked up/
+    written.
 
     No more hardcoded `max_rows`: the search below the platform's own row
     is bounded dynamically via _platform_block_max_rows(), so it stops at
@@ -577,6 +574,12 @@ def fill_current_month_bonus_breakdown(platform: str, breakdown: dict, section: 
     )
 
     missing = [label for label in labels if label not in rows_by_label]
+    for label in list(rows_by_label):
+        cell_text = (grid[rows_by_label[label] - 1][section_col - 1] or "").strip().lower()
+        if label.strip().lower() == "bonus" and cell_text != "bonus":
+            logger.warning("Ligne 'Bonus' exacte non trouvée pour %s (trouvé '%s') - ignorée.", platform, cell_text)
+            del rows_by_label[label]
+            missing.append(label)
     if missing:
         logger.warning(
             "Ligne(s) non trouvée(s) pour %s (ignorée(s), pas de valeur écrite) : %s",
@@ -635,7 +638,8 @@ def find_rows_by_texts_below(grid, start_row, start_col, texts: list, max_rows: 
 
         # Une ligne n'est attribuée qu'à UNE clé : l'égalité exacte d'abord, sinon la clé
         # la plus longue (ex. "cash drag brut %" ne doit pas aussi capter "cash drag brut").
-        candidates = [key for key in remaining if key in value_lower]
+        # "bonus" ne doit jamais capter une ligne comme "intérêts brut avec bonus" (la vraie ligne vient plus bas).
+        candidates = [key for key in remaining if key in value_lower and (key != "bonus" or value_lower == "bonus")]
         if not candidates:
             continue
         key = value_lower if value_lower in candidates else max(candidates, key=len)
@@ -1050,6 +1054,286 @@ def _normalize_borrower_name(name: str) -> str:
     return " ".join(name.strip().lower().split())
 
 
+LANDE_STATUS_ORDER = ("current", "5-30", "31-60", "60", "default")
+LANDE_STATUS_HEADER_LABELS = {
+    "5-30": "5-30 jours de retard",
+    "31-60": "31-60 jours de retard",
+    "60": "60+ jours de retard",
+    "default": "en défaut",
+}
+# Style relevé sur les lignes d'en-tête existantes de la feuille (identique à la ligne "non investi").
+STATUS_HEADER_STYLE = {
+    "horizontalAlignment": "LEFT",
+    "textFormat": {"fontFamily": "Arial", "fontSize": 9, "italic": True, "bold": False},
+    "backgroundColor": {"red": 0.9372549, "green": 0.9372549, "blue": 0.9372549},
+}
+
+
+def _lande_status_of_header(name: str):
+    """Statut Lande correspondant à une ligne d'en-tête de section, ou None."""
+    n = name.strip().casefold()
+    if "défaut" in n or "defaut" in n:
+        return "default"
+    if "60+" in n or "+60" in n:
+        return "60"
+    if "31-60" in n:
+        return "31-60"
+    if "5-30" in n:
+        return "5-30"
+    return None
+
+
+def fill_platform_loan_geo_amounts(
+    platform: str, loan_amounts: dict, loan_statuses, status_order: tuple,
+    status_header_labels: dict, header_status_of,
+) -> list:
+    """Met à jour les lignes de prêts/projets d'une plateforme (Lande, Bricks...)
+    dans la matrice pays de "Répartition géographique". ``loan_amounts`` est
+    indexé par identifiant de prêt, puis par pays : ``{loan_id: {country: remaining_amount}}``.
+    ``status_order`` (le 1er = statut sain, sans en-tête), ``status_header_labels`` et
+    ``header_status_of(nom_ligne)`` décrivent les lignes d'en-tête de statut propres à la plateforme.
+    Les prêts absents du relevé actif sont supprimés; la ligne plateforme est
+    réécrite en formules de somme de ses sous-lignes (comme Bienprêter) et la
+    ligne ``non investi`` reste gérée par sa fonction dédiée.
+    ``loan_statuses`` (``{loan_id: "current"|"5-30"|"31-60"|"60"|"default"}``)
+    range chaque prêt sous la ligne d'en-tête de son statut ("5-30 jours de
+    retard", "31-60 jours de retard", "60+ jours de retard", "en défaut", dans
+    cet ordre sous "non investi") ; les prêts sains restent au-dessus du premier
+    en-tête. Un en-tête est créé s'il a au moins un prêt, supprimé sinon.
+    """
+    logger.info("Début mise à jour Répartition géographique / %s (%d prêt(s))", platform, len(loan_amounts))
+    issues = []
+    worksheet = get_worksheet_by_name("Répartition géographique")
+    grid = _call_with_retry(worksheet.get_all_values)
+
+    geo_pos = find_cell_by_value(grid, "Répartition géographique")
+    if not geo_pos:
+        message = f"Section 'Répartition géographique' non trouvée - lignes de prêts {platform} non mises à jour."
+        logger.warning(message)
+        return [message]
+    geo_row, geo_col = geo_pos
+
+    platform_row = find_first_cell_containing_below(grid, geo_row, geo_col, platform)
+    if not platform_row:
+        message = f"Ligne '{platform}' non trouvée sous 'Répartition géographique'."
+        logger.warning(message)
+        return [message]
+
+    end_row = _find_geo_block_end_row(grid, geo_row, geo_col, platform_row, platform)
+    header_row = grid[geo_row - 1]
+    country_columns = {
+        header_row[col_idx - 1].strip().casefold(): col_idx
+        for col_idx in range(geo_col + 2, len(header_row) + 1)
+        if header_row[col_idx - 1].strip()
+    }
+    if not country_columns:
+        raise RuntimeError(f"Aucune colonne pays trouvée pour la répartition géographique {platform}.")
+
+    first_country_letter = _col_letter(min(country_columns.values()))
+    target_col = geo_col + 1
+    normalized_amounts = {
+        _normalize_borrower_name(str(loan_id)): countries
+        for loan_id, countries in loan_amounts.items()
+    }
+
+    # Ligne plateforme = sommes de ses sous-lignes (comme Bienprêter) ; la borne basse suit les insertions/suppressions.
+    platform_updates = []
+    for col_idx in [target_col, *country_columns.values()]:
+        letter = _col_letter(col_idx)
+        platform_updates.append({
+            "range": rowcol_to_a1(platform_row, col_idx),
+            "values": [[f"=SOMME({letter}{platform_row + 1}:INDEX({letter}:{letter};ROW({letter}{end_row})-1))"]],
+        })
+    statuses = {_normalize_borrower_name(str(loan_id)): status for loan_id, status in (loan_statuses or {}).items()}
+    status_headers = {}  # statut -> numéro de ligne de l'en-tête de section
+    for row_idx in range(platform_row + 1, end_row):
+        row = grid[row_idx - 1]
+        name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
+        header_status = header_status_of(name) if name else None
+        if header_status and header_status not in status_headers:
+            status_headers[header_status] = row_idx
+    header_status_by_row = {row_idx: status for status, row_idx in status_headers.items()}
+
+    def section_of(normalized_id: str):
+        """Statut de l'en-tête sous lequel ranger le prêt (None = prêt sain, avant le premier en-tête)."""
+        status = statuses.get(normalized_id)
+        return status if status in status_header_labels else None
+
+    needed_headers = {section_of(normalized) for normalized in normalized_amounts} - {None}
+
+    rows_to_delete = []
+    existing_rows = {}
+    current_section = None
+    for row_idx in range(platform_row + 1, end_row):
+        row = grid[row_idx - 1]
+        name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
+        if row_idx in header_status_by_row:
+            current_section = header_status_by_row[row_idx]
+            if current_section not in needed_headers:
+                rows_to_delete.append(row_idx)
+            continue
+        if not name or name.casefold() == "non investi":
+            continue
+        normalized = _normalize_borrower_name(name)
+        if normalized not in normalized_amounts or section_of(normalized) != current_section:
+            rows_to_delete.append(row_idx)
+            continue
+        existing_rows.setdefault(normalized, row_idx)
+
+    updates = list(platform_updates)
+    rows_to_restyle = []
+    pending_new_loans = []
+    for loan_id, country_amounts in loan_amounts.items():
+        normalized_id = _normalize_borrower_name(str(loan_id))
+        resolved_amounts = {}
+        for country, amount in country_amounts.items():
+            country = (country or "").strip()
+            country_col = country_columns.get(country.casefold()) if country else None
+            if country_col is None:
+                message = f"Pays {platform} '{country or 'inconnu'}' introuvable pour le prêt {loan_id}; montant non écrit."
+                logger.warning(message)
+                issues.append(message)
+                continue
+            resolved_amounts[country_col] = resolved_amounts.get(country_col, 0.0) + amount
+
+        row_idx = existing_rows.get(normalized_id)
+        if row_idx is None:
+            pending_new_loans.append((str(loan_id), resolved_amounts, section_of(normalized_id)))
+            continue
+
+        rows_to_restyle.append(rowcol_to_a1(row_idx, geo_col))
+        row = grid[row_idx - 1]
+        filled_country_cols = {
+            col_idx for col_idx in country_columns.values()
+            if col_idx - 1 < len(row) and row[col_idx - 1].strip()
+        }
+        for country_col in filled_country_cols | set(resolved_amounts):
+            address = rowcol_to_a1(row_idx, country_col)
+            updates.append({"range": address, "values": [[resolved_amounts.get(country_col, 0.0)]]})
+        formula = f"=SOMME({first_country_letter}{row_idx}:{row_idx})"
+        updates.append({"range": rowcol_to_a1(row_idx, target_col), "values": [[formula]]})
+
+    if updates:
+        _call_with_retry(worksheet.batch_update, updates, value_input_option="USER_ENTERED")
+
+    name_style = {"horizontalAlignment": "RIGHT", "textFormat": {"fontSize": 9, "bold": False, "italic": False}}
+    if rows_to_restyle:
+        _call_with_retry(worksheet.format, rows_to_restyle, name_style)
+
+    # Suppressions avant insertions : les index des lignes à supprimer sont ceux de la grille lue.
+    for row_idx in sorted(rows_to_delete, reverse=True):
+        logger.info("Suppression de la ligne %s obsolète %s.", platform, row_idx)
+        _call_with_retry(worksheet.delete_rows, row_idx, row_idx)
+        for status, header_row_idx in list(status_headers.items()):
+            if header_row_idx == row_idx:
+                del status_headers[status]
+            elif header_row_idx > row_idx:
+                status_headers[status] = header_row_idx - 1
+        end_row -= 1
+
+    # En-têtes manquants créés dans l'ordre canonique, chacun juste avant l'en-tête suivant existant (ou en fin de bloc).
+    created_headers = 0
+    for status in status_order[1:]:
+        if status not in needed_headers or status in status_headers:
+            continue
+        rank = status_order.index(status)
+        later_headers = [r for s, r in status_headers.items() if status_order.index(s) > rank]
+        insert_row = min(later_headers) if later_headers else end_row
+        row_values = [""] * geo_col
+        row_values[geo_col - 1] = status_header_labels[status]
+        _call_with_retry(
+            worksheet.insert_rows, [row_values], insert_row,
+            value_input_option="USER_ENTERED", inherit_from_before=True,
+        )
+        _call_with_retry(worksheet.format, rowcol_to_a1(insert_row, geo_col), STATUS_HEADER_STYLE)
+        for other_status, header_row_idx in status_headers.items():
+            if header_row_idx >= insert_row:
+                status_headers[other_status] = header_row_idx + 1
+        status_headers[status] = insert_row
+        end_row += 1
+        created_headers += 1
+        logger.info("Ajout de la ligne %s '%s' en %s.", platform, status_header_labels[status], insert_row)
+
+    def section_rank(section):
+        return -1 if section is None else status_order.index(section)
+
+    new_rows_to_restyle = []
+    for loan_id, resolved_amounts, section in sorted(pending_new_loans, key=lambda loan: section_rank(loan[2])):
+        section_start = status_headers[section] if section else platform_row
+        later_headers = [r for r in status_headers.values() if r > section_start]
+        insert_row = min(later_headers) if later_headers else end_row
+        row_length = max([geo_col, target_col] + list(country_columns.values()))
+        row_values = [""] * row_length
+        row_values[geo_col - 1] = loan_id
+        row_values[target_col - 1] = f"=SOMME({first_country_letter}{insert_row}:{insert_row})"
+        for country_col, amount in resolved_amounts.items():
+            row_values[country_col - 1] = amount
+        # Hérite du format de la ligne au-dessus, jamais de celle de la plateforme suivante (jaune).
+        _call_with_retry(
+            worksheet.insert_rows, [row_values], insert_row,
+            value_input_option="USER_ENTERED", inherit_from_before=True,
+        )
+        new_rows_to_restyle.append(rowcol_to_a1(insert_row, geo_col))
+        for status, header_row_idx in status_headers.items():
+            if header_row_idx >= insert_row:
+                status_headers[status] = header_row_idx + 1
+        end_row += 1
+
+    if new_rows_to_restyle:
+        _call_with_retry(worksheet.format, new_rows_to_restyle, name_style)
+
+    logger.info(
+        "Mise à jour géographique %s terminée (%d existant(s), %d ajouté(s), %d supprimé(s), %d en-tête(s) créé(s)).",
+        platform, len(existing_rows), len(pending_new_loans), len(rows_to_delete), created_headers,
+    )
+    return issues
+
+
+def fill_lande_loan_geo_amounts(loan_amounts: dict, loan_statuses=None) -> list:
+    """Lignes de prêts Lande : voir fill_platform_loan_geo_amounts()."""
+    return fill_platform_loan_geo_amounts(
+        "Lande", loan_amounts, loan_statuses, LANDE_STATUS_ORDER, LANDE_STATUS_HEADER_LABELS, _lande_status_of_header,
+    )
+
+
+BRICKS_STATUS_ORDER = ("current", "delay", "default")
+BRICKS_STATUS_HEADER_LABELS = {"delay": "en retard", "default": "en défaut"}
+
+
+def _bricks_status_of_header(name: str):
+    """Statut Bricks correspondant à une ligne d'en-tête de section, ou None."""
+    n = name.strip().casefold()
+    if "défaut" in n or "defaut" in n:
+        return "default"
+    if "retard" in n:
+        return "delay"
+    return None
+
+
+def fill_bricks_project_geo_amounts(project_amounts: dict, project_statuses=None) -> list:
+    """Lignes de projets Bricks : voir fill_platform_loan_geo_amounts().
+    ``project_amounts`` = ``{nom_projet: {pays: capital restant}}``,
+    ``project_statuses`` = ``{nom_projet: "current"|"delay"|"default"}``.
+    La ligne "Bricks" devient la somme de ses sous-lignes ("non investi" incluse) : l'en-tête de
+    section "Crowdfunding immobilier" est donc réécrit en ``=C<ligne Bricks>`` pour ne rien compter deux fois.
+    """
+    issues = fill_platform_loan_geo_amounts(
+        "Bricks", project_amounts, project_statuses, BRICKS_STATUS_ORDER, BRICKS_STATUS_HEADER_LABELS, _bricks_status_of_header,
+    )
+    worksheet = get_worksheet_by_name("Répartition géographique")
+    grid = _call_with_retry(worksheet.get_all_values)
+    geo_pos = find_cell_by_value(grid, "Répartition géographique")
+    section_row = find_first_cell_containing_below(grid, geo_pos[0], geo_pos[1], "Crowdfunding immobilier") if geo_pos else None
+    platform_row = find_first_cell_containing_below(grid, geo_pos[0], geo_pos[1], "Bricks") if geo_pos else None
+    if section_row and platform_row and section_row < platform_row:
+        letter = _col_letter(geo_pos[1] + 1)
+        _call_with_retry(
+            worksheet.update, rowcol_to_a1(section_row, geo_pos[1] + 1), [[f"={letter}{platform_row}"]],
+            value_input_option="USER_ENTERED",
+        )
+    return issues
+
+
 def fill_bienpreter_borrower_geo_amounts(borrowers: dict):
     """
     borrowers : {nom_emprunteur: {nom_pays: montant}} - les prêts Bienprêter
@@ -1289,256 +1573,40 @@ def fill_bienpreter_borrower_geo_amounts(borrowers: dict):
     return issues
 
 
-def _find_x_flag_left_of(row, name_col: int, max_lookback: int = 3) -> bool:
-    """Retourne True si l'une des cellules jusqu'à `max_lookback` colonnes à
-    gauche de la colonne (1-based) `name_col` vaut exactement "x"
-    (insensible à la casse). Recherche de la plus proche à la plus
-    éloignée (name_col-1, name_col-2, ...) plutôt qu'un simple
-    row[name_col-2], pour rester robuste si une colonne visuelle
-    supplémentaire (ex. un taux d'intérêt de référence) est un jour
-    insérée entre le flag "x" et le nom du loan originator - repéré le
-    2026-07-30 sur le bloc Peerberry, qui a gagné une colonne "taux
-    d'intérêt" entre le flag et le nom (flag décalé de -2 à -3), alors que
-    les blocs Swaper/Lendermarket n'ont pas cette colonne (flag toujours à
-    -2) - cette fonction gère les deux cas sans distinction par plateforme.
+def get_geo_platform_snapshot(platform: str, next_label: str) -> dict:
+    """Relevé de l'état investi d'une plateforme dans "Répartition
+    géographique" (la configuration des robots - actif, taux, plafonds - vit
+    désormais dans l'onglet "config robots", voir shared/robot_config.py).
+
+    `next_label` : libellé de la plateforme/section suivante, qui borne le
+    bloc de `platform`.
+
+    Retourne :
+    - `country_amounts` : {pays: montant investi} lu sur la ligne de la
+      plateforme (tous loans confondus, actifs ou non).
+    - `loan_invested` : {nom du loan: montant investi} pour chaque ligne du
+      bloc.
+    - `loan_countries` : {nom du loan: pays} pour les loans dont la ligne n'a
+      qu'UNE colonne pays renseignée (repli si la colonne Pays de la config
+      est vide).
     """
-    for offset in range(1, max_lookback + 1):
-        idx = name_col - 1 - offset
-        if idx < 0:
-            break
-        if idx < len(row) and row[idx].strip().lower() == "x":
-            return True
-    return False
-
-
-def _read_originator_max_percentage(row, name_col: int):
-    """Lit le pourcentage plafond par loan originator/lender, ajouté par
-    l'utilisateur le 2026-08-05 dans la colonne 2 colonnes à gauche du nom
-    (row[name_col - 3] en index 0-based) - une colonne à droite du flag
-    "x" (désormais décalé à 3 colonnes à gauche du nom par cet ajout, voir
-    `_find_x_flag_left_of`, dont le `max_lookback=3` gère déjà ce décalage
-    sans modification) et une colonne à gauche de toute colonne visuelle
-    propre à une plateforme (ex. le taux d'intérêt de référence de
-    Peerberry, à 1 colonne à gauche du nom).
-
-    Ce pourcentage représente la part maximale du solde total du compte
-    (investi + disponible) que ce loan originator/lender ne doit jamais
-    dépasser - les bots l'utilisent pour ne pas investir au-delà de ce
-    plafond, même si le loan originator/lender est sélectionné ("x").
-
-    Retourne None si la cellule est vide/non numérique (pas de plafond
-    configuré pour cette ligne)."""
-    idx = name_col - 3
-    if idx < 0 or idx >= len(row):
-        return None
-    return _parse_french_amount(row[idx])
-
-
-def _read_originator_caps(grid, name_col: int, geo_col: int, start_row: int, end_row: int) -> dict:
-    """Construit, pour chaque ligne de loan originator/lender entre
-    `start_row` et `end_row` (exclus, 1-based) du bloc "Répartition
-    géographique", un dict {nom: {"max_percentage": float|None,
-    "invested_amount": float}} - `max_percentage` via
-    `_read_originator_max_percentage()`, `invested_amount` lu directement
-    dans la colonne à droite du nom (`geo_col + 1`, là où
-    fill_geographic_repartition_amounts() écrit le montant actuellement
-    investi pour ce loan originator/lender) - sert de valeur de départ
-    "déjà investi" pour le plafond par loan originator/lender, sur le même
-    principe que `country_amounts` pour le plafond par pays."""
-    caps = {}
-    for row_idx in range(start_row + 1, end_row):
-        row = grid[row_idx - 1]
-
-        name = row[name_col - 1].strip() if name_col - 1 < len(row) else ""
-        if not name or name.lower() == "non investi":
-            continue
-
-        invested_raw = row[geo_col] if geo_col < len(row) else ""
-        caps[name] = {
-            "max_percentage": _read_originator_max_percentage(row, name_col),
-            "invested_amount": _parse_french_amount(invested_raw) or 0.0,
-        }
-
-    return caps
-
-
-def get_selected_peerberry_loan_originators() -> list:
-    """
-    Cherche la cellule "Répartition géographique", puis la cellule
-    "Peerberry" en dessous (même colonne) : les lignes entre "Peerberry" et
-    la cellule "Swaper" suivante (exclues toutes les deux) sont les loan
-    originators du bloc PeerBerry. Pour chacune de ces lignes ayant un nom
-    de loan non vide dans la colonne "Répartition géographique", si la
-    cellule juste à gauche (colonne - 1) vaut "x" (insensible à la casse),
-    ce loan originator est sélectionné.
-
-    Retourne la liste des noms de loan originators sélectionnés (tels
-    qu'écrits dans la feuille, dans l'ordre des lignes).
-    """
-    logger.info("Recherche des loan originators PeerBerry sélectionnés (colonne -1 = 'x')")
-
     worksheet = get_worksheet_by_name("Répartition géographique")
-
-    # 1 seul appel API pour charger toute la feuille
     grid = _call_with_retry(worksheet.get_all_values)
 
     geo_pos = find_cell_by_value(grid, "Répartition géographique")
     if not geo_pos:
-        raise RuntimeError(
-            "La section 'Répartition géographique' n'a pas été trouvée."
-        )
-
+        raise RuntimeError("La section 'Répartition géographique' n'a pas été trouvée.")
     geo_row, geo_col = geo_pos
 
-    if geo_col < 2:
+    platform_row = find_first_cell_containing_below(grid, geo_row, geo_col, platform)
+    if not platform_row:
+        raise RuntimeError(f"La cellule '{platform}' n'a pas été trouvée sous 'Répartition géographique'.")
+
+    end_row = find_first_cell_containing_below(grid, platform_row, geo_col, next_label)
+    if not end_row:
         raise RuntimeError(
-            "Impossible de lire la colonne à gauche des loans : "
-            "'Répartition géographique' est dans la première colonne."
-        )
-
-    peerberry_row = find_first_cell_containing_below(grid, geo_row, geo_col, "Peerberry")
-    if not peerberry_row:
-        raise RuntimeError(
-            "La cellule 'Peerberry' n'a pas été trouvée sous 'Répartition géographique'."
-        )
-
-    swaper_row = find_first_cell_containing_below(grid, peerberry_row, geo_col, "Swaper")
-    if not swaper_row:
-        raise RuntimeError(
-            "La cellule 'Swaper' n'a pas été trouvée sous 'Peerberry' "
-            "(elle délimite la fin du bloc PeerBerry)."
-        )
-
-    selected = []
-    for row_idx in range(peerberry_row + 1, swaper_row):
-        row = grid[row_idx - 1]
-
-        name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
-        if not name or name.lower() == "non investi":
-            continue
-
-        if _find_x_flag_left_of(row, geo_col):
-            selected.append(name)
-            logger.info("Loan originator PeerBerry sélectionné : '%s' (ligne %s)", name, row_idx)
-
-    logger.info("Loan originators PeerBerry sélectionnés : %s", selected)
-    return selected
-
-
-def get_peerberry_min_interest_rate() -> float:
-    """
-    Cherche la cellule "Répartition géographique", puis la ligne "Peerberry"
-    en dessous (même colonne), et lit la valeur numérique (format français,
-    virgule décimale, ex. "8,5") dans la cellule juste à gauche du nom
-    "Peerberry" sur CETTE ligne (pas les lignes des loan originators
-    en dessous, qui ont chacune leur propre valeur dans la même colonne
-    visuelle - non utilisée ici). Ajoutée le 2026-07-30 pour piloter
-    `minInterestRate` de peerberry_invest_bot.py depuis la feuille au lieu
-    d'une valeur codée en dur.
-    """
-    logger.info("Lecture du minInterestRate PeerBerry depuis la cellule à gauche de 'Peerberry'")
-
-    worksheet = get_worksheet_by_name("Répartition géographique")
-
-    grid = _call_with_retry(worksheet.get_all_values)
-
-    geo_pos = find_cell_by_value(grid, "Répartition géographique")
-    if not geo_pos:
-        raise RuntimeError(
-            "La section 'Répartition géographique' n'a pas été trouvée."
-        )
-
-    geo_row, geo_col = geo_pos
-
-    if geo_col < 2:
-        raise RuntimeError(
-            "Impossible de lire la colonne à gauche de 'Peerberry' : "
-            "'Répartition géographique' est dans la première colonne."
-        )
-
-    peerberry_row = find_first_cell_containing_below(grid, geo_row, geo_col, "Peerberry")
-    if not peerberry_row:
-        raise RuntimeError(
-            "La cellule 'Peerberry' n'a pas été trouvée sous 'Répartition géographique'."
-        )
-
-    row = grid[peerberry_row - 1]
-    raw = row[geo_col - 2].strip() if geo_col - 2 < len(row) else ""
-    if not raw:
-        raise RuntimeError(
-            "La cellule à gauche de 'Peerberry' est vide - impossible d'en tirer un minInterestRate."
-        )
-
-    value = float(raw.replace("\u202f", "").replace(" ", "").replace(",", "."))
-    logger.info("minInterestRate PeerBerry lu dans la feuille : %s", value)
-    return value
-
-
-def get_peerberry_country_allocations() -> dict:
-    """
-    Cherche la cellule "Répartition géographique" (sa ligne contient les
-    noms de pays en en-tête de colonne - détectés dynamiquement comme
-    toute colonne à droite de "Répartition géographique" ayant un nom non
-    vide sur cette ligne), puis la ligne "Peerberry" en dessous (même
-    colonne que get_selected_peerberry_loan_originators()/
-    get_peerberry_min_interest_rate()). Ajoutée le 2026-07-31 pour le
-    plafond d'investissement par pays de monitors/peerberry_invest_bot.py.
-
-    Retourne un dict avec :
-    - `threshold_percentage` : la valeur numérique (format français, ex.
-      "10" ou "10,5") lue dans la cellule 2 colonnes à gauche de
-      "Peerberry" SUR SA PROPRE ligne (une colonne de plus à gauche que le
-      minInterestRate lu par get_peerberry_min_interest_rate() - cette
-      cellule sert de flag "x" pour les lignes de loan originators en
-      dessous mais est libre sur la ligne "Peerberry" elle-même). C'est un
-      pourcentage du budget total PeerBerry (investi + disponible) à ne
-      jamais dépasser, par pays. None si la cellule est vide (pas de seuil
-      configuré - le blocage par pays doit alors être désactivé côté
-      appelant).
-    - `country_amounts` : {nom_pays: montant déjà investi} lu directement
-      sur la ligne "Peerberry" elle-même, une valeur par colonne pays -
-      snapshot utilisé comme point de départ par peerberry_invest_bot.py
-      (mis à jour ensuite en cours de run directement via l'API PeerBerry,
-      SANS jamais relire cette feuille - voir ce module).
-    - `originator_countries` : {nom_loan_originator: nom_pays} déduit,
-      pour chaque ligne de loan originator du bloc PeerBerry (entre
-      "Peerberry" et "Swaper" exclus), de la SEULE colonne pays non vide
-      sur sa propre ligne (chaque loan originator PeerBerry n'opère que
-      dans un seul pays) - permet à peerberry_invest_bot.py d'attribuer
-      tout investissement (le sien ou externe) à son pays sans avoir à
-      mapper le `countryId`/un `iso2` renvoyé par l'API PeerBerry.
-    """
-    logger.info("Lecture des allocations par pays PeerBerry depuis la feuille")
-
-    worksheet = get_worksheet_by_name("Répartition géographique")
-
-    grid = _call_with_retry(worksheet.get_all_values)
-
-    geo_pos = find_cell_by_value(grid, "Répartition géographique")
-    if not geo_pos:
-        raise RuntimeError(
-            "La section 'Répartition géographique' n'a pas été trouvée."
-        )
-
-    geo_row, geo_col = geo_pos
-
-    if geo_col < 3:
-        raise RuntimeError(
-            "Impossible de lire le seuil par pays PeerBerry : "
-            "'Répartition géographique' doit avoir au moins 2 colonnes à sa gauche."
-        )
-
-    peerberry_row = find_first_cell_containing_below(grid, geo_row, geo_col, "Peerberry")
-    if not peerberry_row:
-        raise RuntimeError(
-            "La cellule 'Peerberry' n'a pas été trouvée sous 'Répartition géographique'."
-        )
-
-    swaper_row = find_first_cell_containing_below(grid, peerberry_row, geo_col, "Swaper")
-    if not swaper_row:
-        raise RuntimeError(
-            "La cellule 'Swaper' n'a pas été trouvée sous 'Peerberry' "
-            "(elle délimite la fin du bloc PeerBerry)."
+            f"La cellule '{next_label}' n'a pas été trouvée sous '{platform}' "
+            f"(elle délimite la fin du bloc {platform})."
         )
 
     header_row = grid[geo_row - 1]
@@ -1548,676 +1616,38 @@ def get_peerberry_country_allocations() -> dict:
         if header_row[col_idx - 1].strip()
     }
     if not country_columns:
-        raise RuntimeError(
-            "Aucune colonne pays trouvée à droite de 'Répartition géographique'."
-        )
+        raise RuntimeError("Aucune colonne pays trouvée à droite de 'Répartition géographique'.")
 
-    peerberry_data_row = grid[peerberry_row - 1]
+    def cell(row, col_idx) -> str:
+        return row[col_idx - 1].strip() if col_idx - 1 < len(row) else ""
 
-    # Colonne du pourcentage de seuil : 2 colonnes à gauche de "Peerberry"
-    # sur SA PROPRE ligne (une de plus à gauche que le minInterestRate).
-    threshold_col_idx = geo_col - 2
-    threshold_raw = (
-        peerberry_data_row[threshold_col_idx - 1].strip()
-        if 0 <= threshold_col_idx - 1 < len(peerberry_data_row)
-        else ""
-    )
-    threshold_percentage = _parse_french_amount(threshold_raw)
-    if threshold_percentage is None:
-        logger.warning(
-            "Aucun pourcentage de seuil par pays PeerBerry configuré (cellule vide) - "
-            "le blocage par pays devrait être désactivé côté appelant."
-        )
-    else:
-        logger.info("Pourcentage de seuil par pays PeerBerry lu dans la feuille : %s%%", threshold_percentage)
+    platform_data_row = grid[platform_row - 1]
+    country_amounts = {
+        country: _parse_french_amount(cell(platform_data_row, col_idx)) or 0.0
+        for col_idx, country in country_columns.items()
+    }
 
-    country_amounts = {}
-    for col_idx, country_name in country_columns.items():
-        raw = peerberry_data_row[col_idx - 1].strip() if col_idx - 1 < len(peerberry_data_row) else ""
-        country_amounts[country_name] = _parse_french_amount(raw) or 0.0
-
-    originator_countries = {}
-    for row_idx in range(peerberry_row + 1, swaper_row):
+    loan_invested = {}
+    loan_countries = {}
+    for row_idx in range(platform_row + 1, end_row):
         row = grid[row_idx - 1]
-
-        name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
+        name = cell(row, geo_col)
         if not name or name.lower() == "non investi":
             continue
-
-        for col_idx, country_name in country_columns.items():
-            raw = row[col_idx - 1].strip() if col_idx - 1 < len(row) else ""
-            if raw:
-                originator_countries[name] = country_name
-                break
+        loan_invested[name] = _parse_french_amount(cell(row, geo_col + 1)) or 0.0
+        filled = [country for col_idx, country in country_columns.items() if cell(row, col_idx)]
+        if len(filled) == 1:
+            loan_countries[name] = filled[0]
 
     logger.info(
-        "Allocations par pays PeerBerry : seuil=%s%%, %d pays lus, %d loan originators mappés à un pays.",
-        threshold_percentage, len(country_amounts), len(originator_countries),
+        "Relevé géographique %s : %d pays, %d loans (investi total %.2f).",
+        platform, len(country_amounts), len(loan_invested), sum(loan_invested.values()),
     )
-
     return {
-        "threshold_percentage": threshold_percentage,
         "country_amounts": country_amounts,
-        "originator_countries": originator_countries,
+        "loan_invested": loan_invested,
+        "loan_countries": loan_countries,
     }
-
-
-def get_selected_lendermarket_lenders() -> list:
-    """
-    Cherche la cellule "Répartition géographique", puis la cellule
-    "Lendermarket" en dessous (même colonne) : les lignes entre
-    "Lendermarket" et la cellule "Loanch" suivante (exclues toutes les
-    deux) sont les lenders du bloc Lendermarket. Pour chacune de ces
-    lignes ayant un nom de loan non vide dans la colonne "Répartition
-    géographique", si la cellule juste à gauche (colonne - 1) vaut "x"
-    (insensible à la casse), ce lender est sélectionné.
-
-    Même logique exacte que get_selected_peerberry_loan_originators(), pour
-    monitors/lendermarket_monitor.py's invest-structure exploration capture
-    (ajoutée le 2026-07-23).
-
-    Retourne la liste des noms de lenders sélectionnés (tels qu'écrits dans
-    la feuille, dans l'ordre des lignes).
-    """
-    logger.info("Recherche des lenders Lendermarket sélectionnés (colonne -1 = 'x')")
-
-    worksheet = get_worksheet_by_name("Répartition géographique")
-
-    # 1 seul appel API pour charger toute la feuille
-    grid = _call_with_retry(worksheet.get_all_values)
-
-    geo_pos = find_cell_by_value(grid, "Répartition géographique")
-    if not geo_pos:
-        raise RuntimeError(
-            "La section 'Répartition géographique' n'a pas été trouvée."
-        )
-
-    geo_row, geo_col = geo_pos
-
-    if geo_col < 2:
-        raise RuntimeError(
-            "Impossible de lire la colonne à gauche des loans : "
-            "'Répartition géographique' est dans la première colonne."
-        )
-
-    lendermarket_row = find_first_cell_containing_below(grid, geo_row, geo_col, "Lendermarket")
-    if not lendermarket_row:
-        raise RuntimeError(
-            "La cellule 'Lendermarket' n'a pas été trouvée sous 'Répartition géographique'."
-        )
-
-    loanch_row = find_first_cell_containing_below(grid, lendermarket_row, geo_col, "Loanch")
-    if not loanch_row:
-        raise RuntimeError(
-            "La cellule 'Loanch' n'a pas été trouvée sous 'Lendermarket' "
-            "(elle délimite la fin du bloc Lendermarket)."
-        )
-
-    selected = []
-    for row_idx in range(lendermarket_row + 1, loanch_row):
-        row = grid[row_idx - 1]
-
-        name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
-        if not name or name.lower() == "non investi":
-            continue
-
-        if _find_x_flag_left_of(row, geo_col):
-            selected.append(name)
-            logger.info("Lender Lendermarket sélectionné : '%s' (ligne %s)", name, row_idx)
-
-    logger.info("Lenders Lendermarket sélectionnés : %s", selected)
-    return selected
-
-
-def get_lendermarket_min_interest_rate() -> float:
-    """
-    Cherche la cellule "Répartition géographique", puis la ligne
-    "Lendermarket" en dessous (même colonne), et lit la valeur numérique
-    (format français, virgule décimale, ex. "8,5") dans la cellule juste à
-    gauche du nom "Lendermarket" sur CETTE ligne - même logique exacte que
-    get_peerberry_min_interest_rate(). Ajoutée le 2026-07-31 pour piloter
-    `minInterestRate` de monitors/lendermarket_monitor.py depuis la feuille
-    au lieu des valeurs codées en dur par lender dans LENDER_INVEST_FILTERS.
-    """
-    logger.info("Lecture du minInterestRate Lendermarket depuis la cellule à gauche de 'Lendermarket'")
-
-    worksheet = get_worksheet_by_name("Répartition géographique")
-
-    grid = _call_with_retry(worksheet.get_all_values)
-
-    geo_pos = find_cell_by_value(grid, "Répartition géographique")
-    if not geo_pos:
-        raise RuntimeError(
-            "La section 'Répartition géographique' n'a pas été trouvée."
-        )
-
-    geo_row, geo_col = geo_pos
-
-    if geo_col < 2:
-        raise RuntimeError(
-            "Impossible de lire la colonne à gauche de 'Lendermarket' : "
-            "'Répartition géographique' est dans la première colonne."
-        )
-
-    lendermarket_row = find_first_cell_containing_below(grid, geo_row, geo_col, "Lendermarket")
-    if not lendermarket_row:
-        raise RuntimeError(
-            "La cellule 'Lendermarket' n'a pas été trouvée sous 'Répartition géographique'."
-        )
-
-    row = grid[lendermarket_row - 1]
-    raw = row[geo_col - 2].strip() if geo_col - 2 < len(row) else ""
-    if not raw:
-        raise RuntimeError(
-            "La cellule à gauche de 'Lendermarket' est vide - impossible d'en tirer un minInterestRate."
-        )
-
-    value = float(raw.replace("\u202f", "").replace(" ", "").replace(",", "."))
-    logger.info("minInterestRate Lendermarket lu dans la feuille : %s", value)
-    return value
-
-
-def get_lendermarket_country_allocations() -> dict:
-    """
-    Cherche la cellule "Répartition géographique" (sa ligne contient les
-    noms de pays en en-tête de colonne), puis la ligne "Lendermarket" en
-    dessous (même colonne que get_selected_lendermarket_lenders()/
-    get_lendermarket_min_interest_rate()). Même logique exacte que
-    get_peerberry_country_allocations(), adaptée au bloc Lendermarket
-    (borné par "Lendermarket"/"Loanch" au lieu de "Peerberry"/"Swaper").
-    Ajoutée le 2026-07-31 pour le plafond d'investissement par pays de
-    monitors/lendermarket_monitor.py.
-
-    Retourne un dict avec :
-    - `threshold_percentage` : la valeur numérique (format français) lue
-      dans la cellule 2 colonnes à gauche de "Lendermarket" SUR SA PROPRE
-      ligne (une colonne de plus à gauche que le minInterestRate) - un
-      pourcentage du budget total Lendermarket (investi + disponible) à ne
-      jamais dépasser, par pays. None si la cellule est vide (pas de seuil
-      configuré - le blocage par pays doit alors être désactivé côté
-      appelant).
-    - `country_amounts` : {nom_pays: montant déjà investi} lu directement
-      sur la ligne "Lendermarket" elle-même, une valeur par colonne pays.
-    - `originator_countries` : {nom_lender: nom_pays} déduit, pour chaque
-      ligne de lender du bloc Lendermarket (entre "Lendermarket" et
-      "Loanch" exclus), de la SEULE colonne pays non vide sur sa propre
-      ligne.
-    """
-    logger.info("Lecture des allocations par pays Lendermarket depuis la feuille")
-
-    worksheet = get_worksheet_by_name("Répartition géographique")
-
-    grid = _call_with_retry(worksheet.get_all_values)
-
-    geo_pos = find_cell_by_value(grid, "Répartition géographique")
-    if not geo_pos:
-        raise RuntimeError(
-            "La section 'Répartition géographique' n'a pas été trouvée."
-        )
-
-    geo_row, geo_col = geo_pos
-
-    if geo_col < 3:
-        raise RuntimeError(
-            "Impossible de lire le seuil par pays Lendermarket : "
-            "'Répartition géographique' doit avoir au moins 2 colonnes à sa gauche."
-        )
-
-    lendermarket_row = find_first_cell_containing_below(grid, geo_row, geo_col, "Lendermarket")
-    if not lendermarket_row:
-        raise RuntimeError(
-            "La cellule 'Lendermarket' n'a pas été trouvée sous 'Répartition géographique'."
-        )
-
-    loanch_row = find_first_cell_containing_below(grid, lendermarket_row, geo_col, "Loanch")
-    if not loanch_row:
-        raise RuntimeError(
-            "La cellule 'Loanch' n'a pas été trouvée sous 'Lendermarket' "
-            "(elle délimite la fin du bloc Lendermarket)."
-        )
-
-    header_row = grid[geo_row - 1]
-    country_columns = {
-        col_idx: header_row[col_idx - 1].strip()
-        for col_idx in range(geo_col + 1, len(header_row) + 1)
-        if header_row[col_idx - 1].strip()
-    }
-    if not country_columns:
-        raise RuntimeError(
-            "Aucune colonne pays trouvée à droite de 'Répartition géographique'."
-        )
-
-    lendermarket_data_row = grid[lendermarket_row - 1]
-
-    # Colonne du pourcentage de seuil : 2 colonnes à gauche de
-    # "Lendermarket" sur SA PROPRE ligne (une de plus à gauche que le
-    # minInterestRate).
-    threshold_col_idx = geo_col - 2
-    threshold_raw = (
-        lendermarket_data_row[threshold_col_idx - 1].strip()
-        if 0 <= threshold_col_idx - 1 < len(lendermarket_data_row)
-        else ""
-    )
-    threshold_percentage = _parse_french_amount(threshold_raw)
-    if threshold_percentage is None:
-        logger.warning(
-            "Aucun pourcentage de seuil par pays Lendermarket configuré (cellule vide) - "
-            "le blocage par pays devrait être désactivé côté appelant."
-        )
-    else:
-        logger.info("Pourcentage de seuil par pays Lendermarket lu dans la feuille : %s%%", threshold_percentage)
-
-    country_amounts = {}
-    for col_idx, country_name in country_columns.items():
-        raw = lendermarket_data_row[col_idx - 1].strip() if col_idx - 1 < len(lendermarket_data_row) else ""
-        country_amounts[country_name] = _parse_french_amount(raw) or 0.0
-
-    originator_countries = {}
-    for row_idx in range(lendermarket_row + 1, loanch_row):
-        row = grid[row_idx - 1]
-
-        name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
-        if not name or name.lower() == "non investi":
-            continue
-
-        for col_idx, country_name in country_columns.items():
-            raw = row[col_idx - 1].strip() if col_idx - 1 < len(row) else ""
-            if raw:
-                originator_countries[name] = country_name
-                break
-
-    logger.info(
-        "Allocations par pays Lendermarket : seuil=%s%%, %d pays lus, %d lenders mappés à un pays.",
-        threshold_percentage, len(country_amounts), len(originator_countries),
-    )
-
-    return {
-        "threshold_percentage": threshold_percentage,
-        "country_amounts": country_amounts,
-        "originator_countries": originator_countries,
-    }
-
-
-def get_selected_swaper_loan_originators() -> list:
-    """
-    Cherche la cellule "Répartition géographique", puis la cellule
-    "Swaper" en dessous (même colonne) : les lignes entre "Swaper" et la
-    cellule "Crowdlending savings" suivante (exclues toutes les deux) sont
-    les loan originators du bloc Swaper. Pour chacune de ces lignes ayant
-    un nom de loan non vide dans la colonne "Répartition géographique", si
-    la cellule juste à gauche (colonne - 1) vaut "x" (insensible à la
-    casse), ce loan originator est sélectionné.
-
-    Même logique exacte que get_selected_peerberry_loan_originators() /
-    get_selected_lendermarket_lenders(), pour
-    monitors/swaper_monitor.py's per-originator auto-invest (ajouté le
-    2026-07-25) : les noms retournés ici sont utilisés tels quels comme
-    valeur du filtre "Loan originators" de swaper.com (confirmé via
-    DevTools que l'API `/rest/public/loans` accepte directement le nom
-    affiché dans son champ `"groups"`, ex. `"groups": ["Wandoo Finance
-    Group"]` - pas un id opaque).
-
-    Retourne la liste des noms de loan originators sélectionnés (tels
-    qu'écrits dans la feuille, dans l'ordre des lignes).
-    """
-    logger.info("Recherche des loan originators Swaper sélectionnés (colonne -1 = 'x')")
-
-    worksheet = get_worksheet_by_name("Répartition géographique")
-
-    # 1 seul appel API pour charger toute la feuille
-    grid = _call_with_retry(worksheet.get_all_values)
-
-    geo_pos = find_cell_by_value(grid, "Répartition géographique")
-    if not geo_pos:
-        raise RuntimeError(
-            "La section 'Répartition géographique' n'a pas été trouvée."
-        )
-
-    geo_row, geo_col = geo_pos
-
-    if geo_col < 2:
-        raise RuntimeError(
-            "Impossible de lire la colonne à gauche des loans : "
-            "'Répartition géographique' est dans la première colonne."
-        )
-
-    swaper_row = find_first_cell_containing_below(grid, geo_row, geo_col, "Swaper")
-    if not swaper_row:
-        raise RuntimeError(
-            "La cellule 'Swaper' n'a pas été trouvée sous 'Répartition géographique'."
-        )
-
-    crowdlending_row = find_first_cell_containing_below(grid, swaper_row, geo_col, "Crowdlending savings")
-    if not crowdlending_row:
-        raise RuntimeError(
-            "La cellule 'Crowdlending savings' n'a pas été trouvée sous 'Swaper' "
-            "(elle délimite la fin du bloc Swaper)."
-        )
-
-    selected = []
-    for row_idx in range(swaper_row + 1, crowdlending_row):
-        row = grid[row_idx - 1]
-
-        name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
-        if not name or name.lower() == "non investi":
-            continue
-
-        if _find_x_flag_left_of(row, geo_col):
-            selected.append(name)
-            logger.info("Loan originator Swaper sélectionné : '%s' (ligne %s)", name, row_idx)
-
-    logger.info("Loan originators Swaper sélectionnés : %s", selected)
-    return selected
-
-
-def get_swaper_min_interest_rate() -> float:
-    """
-    Cherche la cellule "Répartition géographique", puis la ligne "Swaper"
-    en dessous (même colonne), et lit la valeur numérique (format
-    français, virgule décimale, ex. "8,5") dans la cellule juste à gauche
-    du nom "Swaper" sur CETTE ligne - même logique exacte que
-    get_peerberry_min_interest_rate()/get_lendermarket_min_interest_rate().
-    Ajoutée le 2026-07-31 pour piloter un taux d'intérêt minimum côté
-    monitors/swaper_monitor.py (filtrage client-side sur
-    `interestRatePerYear`, l'API `/rest/public/loans` n'exposant pas de
-    paramètre de filtre par taux connu/vérifié, contrairement au
-    "groups").
-    """
-    logger.info("Lecture du minInterestRate Swaper depuis la cellule à gauche de 'Swaper'")
-
-    worksheet = get_worksheet_by_name("Répartition géographique")
-
-    grid = _call_with_retry(worksheet.get_all_values)
-
-    geo_pos = find_cell_by_value(grid, "Répartition géographique")
-    if not geo_pos:
-        raise RuntimeError(
-            "La section 'Répartition géographique' n'a pas été trouvée."
-        )
-
-    geo_row, geo_col = geo_pos
-
-    if geo_col < 2:
-        raise RuntimeError(
-            "Impossible de lire la colonne à gauche de 'Swaper' : "
-            "'Répartition géographique' est dans la première colonne."
-        )
-
-    swaper_row = find_first_cell_containing_below(grid, geo_row, geo_col, "Swaper")
-    if not swaper_row:
-        raise RuntimeError(
-            "La cellule 'Swaper' n'a pas été trouvée sous 'Répartition géographique'."
-        )
-
-    row = grid[swaper_row - 1]
-    raw = row[geo_col - 2].strip() if geo_col - 2 < len(row) else ""
-    if not raw:
-        raise RuntimeError(
-            "La cellule à gauche de 'Swaper' est vide - impossible d'en tirer un minInterestRate."
-        )
-
-    value = float(raw.replace("\u202f", "").replace(" ", "").replace(",", "."))
-    logger.info("minInterestRate Swaper lu dans la feuille : %s", value)
-    return value
-
-
-def get_swaper_country_allocations() -> dict:
-    """
-    Cherche la cellule "Répartition géographique" (sa ligne contient les
-    noms de pays en en-tête de colonne), puis la ligne "Swaper" en
-    dessous (même colonne que get_selected_swaper_loan_originators()/
-    get_swaper_min_interest_rate()). Même logique exacte que
-    get_peerberry_country_allocations()/get_lendermarket_country_allocations(),
-    adaptée au bloc Swaper (borné par "Swaper"/"Crowdlending savings" au
-    lieu de "Peerberry"/"Swaper" ou "Lendermarket"/"Loanch"). Ajoutée le
-    2026-07-31 pour le plafond d'investissement par pays de
-    monitors/swaper_monitor.py.
-
-    Retourne un dict avec :
-    - `threshold_percentage` : la valeur numérique (format français) lue
-      dans la cellule 2 colonnes à gauche de "Swaper" SUR SA PROPRE ligne
-      (une colonne de plus à gauche que le minInterestRate) - un
-      pourcentage du budget total Swaper (investi + disponible) à ne
-      jamais dépasser, par pays. None si la cellule est vide (pas de
-      seuil configuré - le blocage par pays doit alors être désactivé
-      côté appelant).
-    - `country_amounts` : {nom_pays: montant déjà investi} lu directement
-      sur la ligne "Swaper" elle-même, une valeur par colonne pays.
-    - `originator_countries` : {nom_loan_originator: nom_pays} déduit,
-      pour chaque ligne de loan originator du bloc Swaper (entre "Swaper"
-      et "Crowdlending savings" exclus), de la SEULE colonne pays non
-      vide sur sa propre ligne.
-    """
-    logger.info("Lecture des allocations par pays Swaper depuis la feuille")
-
-    worksheet = get_worksheet_by_name("Répartition géographique")
-
-    grid = _call_with_retry(worksheet.get_all_values)
-
-    geo_pos = find_cell_by_value(grid, "Répartition géographique")
-    if not geo_pos:
-        raise RuntimeError(
-            "La section 'Répartition géographique' n'a pas été trouvée."
-        )
-
-    geo_row, geo_col = geo_pos
-
-    if geo_col < 3:
-        raise RuntimeError(
-            "Impossible de lire le seuil par pays Swaper : "
-            "'Répartition géographique' doit avoir au moins 2 colonnes à sa gauche."
-        )
-
-    swaper_row = find_first_cell_containing_below(grid, geo_row, geo_col, "Swaper")
-    if not swaper_row:
-        raise RuntimeError(
-            "La cellule 'Swaper' n'a pas été trouvée sous 'Répartition géographique'."
-        )
-
-    crowdlending_row = find_first_cell_containing_below(grid, swaper_row, geo_col, "Crowdlending savings")
-    if not crowdlending_row:
-        raise RuntimeError(
-            "La cellule 'Crowdlending savings' n'a pas été trouvée sous 'Swaper' "
-            "(elle délimite la fin du bloc Swaper)."
-        )
-
-    header_row = grid[geo_row - 1]
-    country_columns = {
-        col_idx: header_row[col_idx - 1].strip()
-        for col_idx in range(geo_col + 1, len(header_row) + 1)
-        if header_row[col_idx - 1].strip()
-    }
-    if not country_columns:
-        raise RuntimeError(
-            "Aucune colonne pays trouvée à droite de 'Répartition géographique'."
-        )
-
-    swaper_data_row = grid[swaper_row - 1]
-
-    # Colonne du pourcentage de seuil : 2 colonnes à gauche de "Swaper" sur
-    # SA PROPRE ligne (une de plus à gauche que le minInterestRate).
-    threshold_col_idx = geo_col - 2
-    threshold_raw = (
-        swaper_data_row[threshold_col_idx - 1].strip()
-        if 0 <= threshold_col_idx - 1 < len(swaper_data_row)
-        else ""
-    )
-    threshold_percentage = _parse_french_amount(threshold_raw)
-    if threshold_percentage is None:
-        logger.warning(
-            "Aucun pourcentage de seuil par pays Swaper configuré (cellule vide) - "
-            "le blocage par pays devrait être désactivé côté appelant."
-        )
-    else:
-        logger.info("Pourcentage de seuil par pays Swaper lu dans la feuille : %s%%", threshold_percentage)
-
-    country_amounts = {}
-    for col_idx, country_name in country_columns.items():
-        raw = swaper_data_row[col_idx - 1].strip() if col_idx - 1 < len(swaper_data_row) else ""
-        country_amounts[country_name] = _parse_french_amount(raw) or 0.0
-
-    originator_countries = {}
-    for row_idx in range(swaper_row + 1, crowdlending_row):
-        row = grid[row_idx - 1]
-
-        name = row[geo_col - 1].strip() if geo_col - 1 < len(row) else ""
-        if not name or name.lower() == "non investi":
-            continue
-
-        for col_idx, country_name in country_columns.items():
-            raw = row[col_idx - 1].strip() if col_idx - 1 < len(row) else ""
-            if raw:
-                originator_countries[name] = country_name
-                break
-
-    logger.info(
-        "Allocations par pays Swaper : seuil=%s%%, %d pays lus, %d loan originators mappés à un pays.",
-        threshold_percentage, len(country_amounts), len(originator_countries),
-    )
-
-    return {
-        "threshold_percentage": threshold_percentage,
-        "country_amounts": country_amounts,
-        "originator_countries": originator_countries,
-    }
-
-
-def get_peerberry_originator_caps() -> dict:
-    """
-    Plafond par loan originator PeerBerry (ajouté le 2026-08-05, en plus
-    du plafond par pays existant) : pour chaque loan originator du bloc
-    PeerBerry (entre "Peerberry" et "Swaper" exclus, même bornes que
-    get_selected_peerberry_loan_originators()), lit le pourcentage plafond
-    (voir `_read_originator_max_percentage()`, colonne name_col-2) et le
-    montant déjà investi (colonne name_col+1, celle où
-    fill_geographic_repartition_amounts() écrit le montant courant).
-
-    Le pourcentage représente la part maximale du solde total du compte
-    (investi + disponible) que ce loan originator ne doit jamais dépasser
-    - monitors/peerberry_invest_bot.py ne doit pas investir au-delà de ce
-    plafond, en plus du plafond par pays existant. Une valeur vide
-    (`max_percentage: None`) signifie aucun plafond configuré pour ce
-    loan originator.
-
-    Retourne {nom_loan_originator: {"max_percentage": float|None,
-    "invested_amount": float}}.
-    """
-    logger.info("Lecture des plafonds par loan originator PeerBerry depuis la feuille")
-
-    worksheet = get_worksheet_by_name("Répartition géographique")
-
-    grid = _call_with_retry(worksheet.get_all_values)
-
-    geo_pos = find_cell_by_value(grid, "Répartition géographique")
-    if not geo_pos:
-        raise RuntimeError(
-            "La section 'Répartition géographique' n'a pas été trouvée."
-        )
-
-    geo_row, geo_col = geo_pos
-
-    peerberry_row = find_first_cell_containing_below(grid, geo_row, geo_col, "Peerberry")
-    if not peerberry_row:
-        raise RuntimeError(
-            "La cellule 'Peerberry' n'a pas été trouvée sous 'Répartition géographique'."
-        )
-
-    swaper_row = find_first_cell_containing_below(grid, peerberry_row, geo_col, "Swaper")
-    if not swaper_row:
-        raise RuntimeError(
-            "La cellule 'Swaper' n'a pas été trouvée sous 'Peerberry' "
-            "(elle délimite la fin du bloc PeerBerry)."
-        )
-
-    caps = _read_originator_caps(grid, geo_col, geo_col, peerberry_row, swaper_row)
-    logger.info("Plafonds par loan originator PeerBerry lus : %s", caps)
-    return caps
-
-
-def get_lendermarket_originator_caps() -> dict:
-    """
-    Plafond par lender Lendermarket (ajouté le 2026-08-05, en plus du
-    plafond par pays existant) - même logique exacte que
-    get_peerberry_originator_caps(), adaptée au bloc Lendermarket (borné
-    par "Lendermarket"/"Loanch" au lieu de "Peerberry"/"Swaper", mêmes
-    bornes que get_selected_lendermarket_lenders()).
-
-    Retourne {nom_lender: {"max_percentage": float|None,
-    "invested_amount": float}}.
-    """
-    logger.info("Lecture des plafonds par lender Lendermarket depuis la feuille")
-
-    worksheet = get_worksheet_by_name("Répartition géographique")
-
-    grid = _call_with_retry(worksheet.get_all_values)
-
-    geo_pos = find_cell_by_value(grid, "Répartition géographique")
-    if not geo_pos:
-        raise RuntimeError(
-            "La section 'Répartition géographique' n'a pas été trouvée."
-        )
-
-    geo_row, geo_col = geo_pos
-
-    lendermarket_row = find_first_cell_containing_below(grid, geo_row, geo_col, "Lendermarket")
-    if not lendermarket_row:
-        raise RuntimeError(
-            "La cellule 'Lendermarket' n'a pas été trouvée sous 'Répartition géographique'."
-        )
-
-    loanch_row = find_first_cell_containing_below(grid, lendermarket_row, geo_col, "Loanch")
-    if not loanch_row:
-        raise RuntimeError(
-            "La cellule 'Loanch' n'a pas été trouvée sous 'Lendermarket' "
-            "(elle délimite la fin du bloc Lendermarket)."
-        )
-
-    caps = _read_originator_caps(grid, geo_col, geo_col, lendermarket_row, loanch_row)
-    logger.info("Plafonds par lender Lendermarket lus : %s", caps)
-    return caps
-
-
-def get_swaper_originator_caps() -> dict:
-    """
-    Plafond par loan originator Swaper (ajouté le 2026-08-05, en plus du
-    plafond par pays existant) - même logique exacte que
-    get_peerberry_originator_caps(), adaptée au bloc Swaper (borné par
-    "Swaper"/"Crowdlending savings", mêmes bornes que
-    get_selected_swaper_loan_originators()).
-
-    Retourne {nom_loan_originator: {"max_percentage": float|None,
-    "invested_amount": float}}.
-    """
-    logger.info("Lecture des plafonds par loan originator Swaper depuis la feuille")
-
-    worksheet = get_worksheet_by_name("Répartition géographique")
-
-    grid = _call_with_retry(worksheet.get_all_values)
-
-    geo_pos = find_cell_by_value(grid, "Répartition géographique")
-    if not geo_pos:
-        raise RuntimeError(
-            "La section 'Répartition géographique' n'a pas été trouvée."
-        )
-
-    geo_row, geo_col = geo_pos
-
-    swaper_row = find_first_cell_containing_below(grid, geo_row, geo_col, "Swaper")
-    if not swaper_row:
-        raise RuntimeError(
-            "La cellule 'Swaper' n'a pas été trouvée sous 'Répartition géographique'."
-        )
-
-    crowdlending_row = find_first_cell_containing_below(grid, swaper_row, geo_col, "Crowdlending savings")
-    if not crowdlending_row:
-        raise RuntimeError(
-            "La cellule 'Crowdlending savings' n'a pas été trouvée sous 'Swaper' "
-            "(elle délimite la fin du bloc Swaper)."
-        )
-
-    caps = _read_originator_caps(grid, geo_col, geo_col, swaper_row, crowdlending_row)
-    logger.info("Plafonds par loan originator Swaper lus : %s", caps)
-    return caps
 
 
 if __name__ == "__main__":

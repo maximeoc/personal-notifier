@@ -183,7 +183,7 @@ MONEFIT_PASSWORD = os.environ.get("MONEFIT_PASSWORD")
 SESSION_STATE_FILE = Path(__file__).parent / "monefit_diversification_session_state.json"
 XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "monefit_xirr_cashflows_state.json"
 XIRR_CASHFLOWS_STATE_DEFAULT = {"monthly_summaries": {}, "last_fetched_month": None}
-XIRR_CACHE_SCHEMA_VERSION = 2
+XIRR_CACHE_SCHEMA_VERSION = 3
 # Conservative floor for the one-time yearly scan used to find the
 # account's real inception year (see _find_first_active_year()) - well
 # before Monefit SmartSaver existed, just a safety bound on the scan length.
@@ -333,6 +333,7 @@ def fetch_statement_summary(session: requests.Session, start_date: date, end_dat
                 daily_returns, ledger_interest, start_date, end_date,
             )
             daily_returns = ledger_interest
+            vault_interest = 0.0  # the ledger figure already includes vault interest
 
     log.info(
         "Parsed statement totals: daily_returns=%.2f, vault_interest=%.2f, rewards_bonuses=%.2f, matured_vaults=%.2f, "
@@ -355,6 +356,15 @@ def fetch_statement_summary(session: requests.Session, start_date: date, end_dat
 def _total_interest(summary: dict) -> float:
     """Main-account interest plus vault interest (absent from entries cached before vault support)."""
     return summary["daily_returns"] + summary.get("vault_interest", 0.0)
+
+
+def _prev_month_avg_balance(monthly_summaries: dict | None, month_key: str) -> float | None:
+    """Whole-account (opening+closing)/2 of the month before `month_key`, or None if it isn't cached."""
+    earlier = sorted(k for k in (monthly_summaries or {}) if k < month_key)
+    if not earlier or monthly_summaries[earlier[-1]].get("closing_balance") is None:
+        return None
+    prev = monthly_summaries[earlier[-1]]
+    return (prev["opening_balance"] + prev["closing_balance"]) / 2
 
 
 def fetch_current_month_statement_totals(session: requests.Session) -> dict:
@@ -579,6 +589,10 @@ def run() -> None:
         log.exception("Failed to fetch the monthly statement summary history - XIRR will not be updated.")
         monthly_summaries = None
 
+    # Like the other platforms, "Rendements % brut" divides by the PREVIOUS month's average balance
+    # (None for an account's first month, so no yield is reported for it).
+    prev_avg_total_balance = _prev_month_avg_balance(monthly_summaries, f"{end_date.year:04d}-{end_date.month:02d}")
+
     if monthly_summaries:
         # get_cached_monthly_summaries()'s cache accumulates every month
         # ever fetched by ANY past run - for a backfilled month, filter out
@@ -649,7 +663,8 @@ def run() -> None:
 
 
     if current_month and total_invested > 0:
-        cash_weight = avg_idle_cash / (avg_idle_cash + total_invested)
+        # The main account earns daily returns too (interestIncome), so it is not idle cash: no drag.
+        cash_weight = 0.0
         monthly_yield_rate = interest_total / total_invested
         cash_drag_brut_value = cash_weight * monthly_yield_rate
         # Monefit has no withholding-tax data at all (see module
@@ -669,23 +684,27 @@ def run() -> None:
         # genuine, real platform fees ("fees" field) but no withholding-
         # tax data at all (Taxes brut % hardcoded 0.0, same reasoning as
         # "XIRR Taxes" above).
-        avg_total_balance_month = total_invested + avg_idle_cash
-        missed_earnings_month = cash_drag_brut_value * avg_total_balance_month
-        monthly_yield_steps = [
-            ("Intérêts brut %", interest_total + missed_earnings_month),
-            ("Cash drag brut %", -missed_earnings_month),
-            ("Bonus brut %", statement_totals["rewards_bonuses"]),
-            ("Frais brut %", -statement_totals["fees"]),
-            ("Taxes brut %", 0.0),
-        ]
-        monthly_yield_shares = compute_monthly_yield_shares(
-            avg_total_balance_month, monthly_yield_steps, log=log, log_context="Monefit",
-        )
-        rendement_brut_value = sum(v for v in monthly_yield_shares.values() if v is not None)
-        log.info(
-            "Monthly gross-yield waterfall shares: Rendements %% brut=%.2f%% %r",
-            rendement_brut_value * 100, {k: round(v * 100, 4) for k, v in monthly_yield_shares.items() if v is not None},
-        )
+        avg_total_balance_month = prev_avg_total_balance
+        if avg_total_balance_month is not None and avg_total_balance_month > 0:
+            missed_earnings_month = cash_drag_brut_value * avg_total_balance_month
+            monthly_yield_steps = [
+                ("Intérêts brut %", interest_total + missed_earnings_month),
+                ("Cash drag brut %", -missed_earnings_month),
+                ("Bonus brut %", statement_totals["rewards_bonuses"]),
+                ("Frais brut %", -statement_totals["fees"]),
+                ("Taxes brut %", 0.0),
+            ]
+            monthly_yield_shares = compute_monthly_yield_shares(
+                avg_total_balance_month, monthly_yield_steps, log=log, log_context="Monefit",
+            )
+            rendement_brut_value = sum(v for v in monthly_yield_shares.values() if v is not None)
+            log.info(
+                "Monthly gross-yield waterfall shares (previous month avg balance %.2f EUR): Rendements %% brut=%.2f%% %r",
+                avg_total_balance_month, rendement_brut_value * 100,
+                {k: round(v * 100, 4) for k, v in monthly_yield_shares.items() if v is not None},
+            )
+        else:
+            log.warning("No positive previous-month average balance - Rendements %% brut not computed.")
 
         if xirr_value is not None and signed_cashflows is not None and monthly_summaries:
             cash_weight_lifetime = cash_weight  # no real historical idle-cash time series - reuse the live snapshot (see comment above).
@@ -721,14 +740,35 @@ def run() -> None:
                 avg_idle_cash, missed_earnings, {k: round(v * 100, 4) for k, v in waterfall_shares.items() if v is not None},
             )
 
-    # Monefit's "bonus" field ("Rewards & bonuses") maps to "prime" (a
-    # referral-style reward) - written to its own dedicated sub-row, never
-    # to the "Bonus" row itself (a SUM formula over prime/cashback/
-    # concours). Note: Monefit also runs a separate weekly investment-draw
-    # ("concours"-style lottery, confirmed via live page text: "5 winners
-    # ... picked at random") but the account/summary API has no distinct
-    # field for draw winnings - only "prime" is written here, "concours"
-    # is left untouched pending a dedicated data source. "XIRR"/"Cash
+    if not current_month and closing_balance is not None:
+        # Backfilled month: previous month's whole-account (opening+closing)/2 is the denominator;
+        # idle cash has no history, so Cash drag is left out (its row stays untouched).
+        avg_total_balance_month = prev_avg_total_balance if prev_avg_total_balance is not None else 0.0
+        monthly_yield_steps = [
+            ("Intérêts brut %", interest_total),
+            ("Bonus brut %", statement_totals["rewards_bonuses"]),
+            ("Frais brut %", -statement_totals["fees"]),
+            ("Taxes brut %", 0.0),
+        ]
+        monthly_yield_shares = compute_monthly_yield_shares(
+            avg_total_balance_month, monthly_yield_steps, log=log, log_context="Monefit (backfilled month)",
+        )
+        if any(v is not None for v in monthly_yield_shares.values()):
+            rendement_brut_value = sum(v for v in monthly_yield_shares.values() if v is not None)
+            log.info(
+                "Monthly gross-yield waterfall shares (backfilled month, avg balance %.2f EUR): Rendements %% brut=%.2f%% %r",
+                avg_total_balance_month, rendement_brut_value * 100,
+                {k: round(v * 100, 4) for k, v in monthly_yield_shares.items() if v is not None},
+            )
+        else:
+            log.warning("No positive previous-month average balance for the backfilled month - Rendements %% brut not computed.")
+
+    # Monefit's "bonus" field ("Rewards & bonuses") is written directly to
+    # the "Bonus" row (no more prime/cashback/concours sub-rows). Note:
+    # Monefit also runs a separate weekly investment-draw (lottery,
+    # confirmed via live page text: "5 winners ... picked at random") but
+    # the account/summary API has no distinct field for draw winnings.
+    # "XIRR"/"Cash
     # drag" and the XIRR Bonus/Cash drag/Taxes-Frais/Intérêts pie-chart
     # shares (rows already added by the user) are only included when
     # actually computed. "XIRR Intérêts" (added 2026-08-19) sits right
@@ -774,7 +814,7 @@ def run() -> None:
             avg_invested_balance,
         )
 
-    bonus_breakdown = {"prime": statement_totals["rewards_bonuses"]}
+    bonus_breakdown = {"Bonus": statement_totals["rewards_bonuses"]}
     if xirr_value is not None:
         bonus_breakdown["XIRR"] = xirr_value
     if rendement_brut_value is not None:

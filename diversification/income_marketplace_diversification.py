@@ -711,44 +711,43 @@ def run() -> None:
                         # (unconditionally, backfill-aware) - only the
                         # lifetime waterfall shares still need this
                         # current-month-only XIRR block.
-                        if cash_drag_brut_value is not None:
-                            if deposit_dates and total_invested > 0:
-                                since_inception_date = min(deposit_dates)
-                                avg_idle_cash_lifetime = compute_time_weighted_average(cash_events, since_inception_date, today_date)
-                                cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + total_invested)
-                                lifetime_yield_rate = lifetime_gross_interest / total_invested
-                                cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
-                                missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_invested)
+                        if deposit_dates and total_invested > 0:
+                            since_inception_date = min(deposit_dates)
+                            avg_idle_cash_lifetime = compute_time_weighted_average(cash_events, since_inception_date, today_date)
+                            cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + total_invested)
+                            lifetime_yield_rate = lifetime_gross_interest / total_invested
+                            cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
+                            missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_invested)
 
-                                # Waterfall decomposition (switched from
-                                # Shapley 2026-09-09, see
-                                # shared/xirr_waterfall.py's module
-                                # docstring for why) - walks a true
-                                # 0%-return baseline up to
-                                # total_account_value in the fixed order
-                                # Intérêts -> Cash drag -> Bonus (Taxes/
-                                # Frais are excluded, both hardcoded 0.0,
-                                # no distinct data source exists for
-                                # either on this platform, see
-                                # docstring). No withholding tax here, so
-                                # lifetime_gross_interest already is the
-                                # net figure.
-                                steps = [
-                                    ("XIRR Intérêts", lifetime_gross_interest + missed_earnings),
-                                    ("XIRR Cash drag", -missed_earnings),
-                                    ("XIRR Bonus", lifetime_bonus_total),
-                                ]
-                                waterfall_shares = compute_waterfall_xirr_shares(
-                                    signed_cashflows[:-1], today_date, total_account_value, steps,
-                                    log=log, log_context="Income Marketplace",
-                                )
-                                bonus_xirr_contribution = waterfall_shares.get("XIRR Bonus")
-                                cash_drag_xirr_contribution = waterfall_shares.get("XIRR Cash drag")
-                                interest_xirr_contribution = waterfall_shares.get("XIRR Intérêts")
-                                log.info(
-                                    "XIRR Waterfall shares (since-inception, missed earnings ~%.2f EUR): %r",
-                                    missed_earnings, {k: round(v * 100, 4) for k, v in waterfall_shares.items() if v is not None},
-                                )
+                            # Waterfall decomposition (switched from
+                            # Shapley 2026-09-09, see
+                            # shared/xirr_waterfall.py's module
+                            # docstring for why) - walks a true
+                            # 0%-return baseline up to
+                            # total_account_value in the fixed order
+                            # Intérêts -> Cash drag -> Bonus (Taxes/
+                            # Frais are excluded, both hardcoded 0.0,
+                            # no distinct data source exists for
+                            # either on this platform, see
+                            # docstring). No withholding tax here, so
+                            # lifetime_gross_interest already is the
+                            # net figure.
+                            steps = [
+                                ("XIRR Intérêts", lifetime_gross_interest + missed_earnings),
+                                ("XIRR Cash drag", -missed_earnings),
+                                ("XIRR Bonus", lifetime_bonus_total),
+                            ]
+                            waterfall_shares = compute_waterfall_xirr_shares(
+                                signed_cashflows[:-1], today_date, total_account_value, steps,
+                                log=log, log_context="Income Marketplace",
+                            )
+                            bonus_xirr_contribution = waterfall_shares.get("XIRR Bonus")
+                            cash_drag_xirr_contribution = waterfall_shares.get("XIRR Cash drag")
+                            interest_xirr_contribution = waterfall_shares.get("XIRR Intérêts")
+                            log.info(
+                                "XIRR Waterfall shares (since-inception, missed earnings ~%.2f EUR): %r",
+                                missed_earnings, {k: round(v * 100, 4) for k, v in waterfall_shares.items() if v is not None},
+                            )
 
             browser.close()
     except Exception:
@@ -764,8 +763,7 @@ def run() -> None:
     bonus_breakdown = {
         "prélèvements": amounts["withholding_tax"],
     }
-    if amounts["bonus_cashback_contest"]:
-        bonus_breakdown["prime"] = amounts["bonus_cashback_contest"]
+    bonus_breakdown["Bonus"] = amounts["bonus_cashback_contest"]
     if rendement_brut_value is not None:
         bonus_breakdown["Rendements % brut"] = rendement_brut_value
     for step_name in ("Intérêts brut %", "Cash drag brut %", "Bonus brut %", "Frais brut %", "Taxes brut %"):

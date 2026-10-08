@@ -871,6 +871,9 @@ def run() -> None:
     # same convention as Afranga/Swaper/Lendermarket.
     current_month = is_current_month()
     today_date = get_report_now(REPORT_TIMEZONE).date()
+    # A backfill simulating the month's last day for the still-running month must compute "as of" the real day.
+    if current_month:
+        today_date = min(today_date, datetime.now(REPORT_TIMEZONE).date())
     # BUGFIX 2026-08-21: is_current_month() only compares the MONTH, not the
     # exact day - a backfill run (scripts/run_diversification_for_month_
     # range.sh) that simulates "now" as some other day within the current
@@ -986,7 +989,8 @@ def run() -> None:
             cache_last_fetched = datetime.strptime(raw_last_fetched, "%Y-%m-%d").date() if raw_last_fetched else None
         except Exception:
             cache_last_fetched = None
-        if all_entries and (cache_last_fetched is None or cache_last_fetched < today_date) and real_today >= today_date:
+        # Empty/missing cache (fresh CI runner) must be populated too, not just a stale one.
+        if (cache_last_fetched is None or cache_last_fetched < today_date) and real_today >= today_date:
             try:
                 log.info("Cached transactions only go up to %s - refreshing up to the real day %s before the backfill.", cache_last_fetched, real_today)
                 all_entries = get_cached_transactions(session, real_today.strftime("%Y-%m-%d"))
@@ -1264,10 +1268,9 @@ def run() -> None:
         skip_total=not current_month,
     )
 
-    # PeerBerry's REFERRAL_FEE is treated as a "prime" (referral reward),
-    # same convention as Swaper's referral bonus - written to its own
-    # dedicated sub-row, never to the "Bonus" row itself (a SUM formula
-    # over prime/cashback/concours). "XIRR"/"Cash drag" and the XIRR
+    # PeerBerry's REFERRAL_FEE (referral reward) is written directly to
+    # the "Bonus" row (no more prime/cashback/concours sub-rows).
+    # "XIRR"/"Cash drag" and the XIRR
     # Bonus/Cash drag/Taxes-Frais/Intérêts pie-chart shares (rows already
     # added by the user, mirroring Afranga/Swaper/Lendermarket's own
     # blocks) sit further below - only included when actually computed.
@@ -1278,7 +1281,7 @@ def run() -> None:
     # (right after "XIRR Taxes/Frais") for this new value to actually land
     # somewhere - this script fills an existing row by label, it doesn't
     # insert new labelled rows into this block.
-    bonus_breakdown = {"prime": monthly_referral_bonus}
+    bonus_breakdown = {"Bonus": monthly_referral_bonus}
     if xirr_value is not None:
         bonus_breakdown["XIRR"] = xirr_value
     if rendement_brut_value is not None:

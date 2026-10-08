@@ -260,8 +260,9 @@ REPORT_TIMEZONE = ZoneInfo("Europe/Paris")
 # history (77+ pages) on every run.
 SESSION_STATE_FILE = Path(__file__).parent / "bienpreter_diversification_session_state.json"
 XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "bienpreter_xirr_cashflows_state.json"
-# Bump when the cached row shape changes (v2: interest/embedded tax parsed from each row's detail panel).
-XIRR_CACHE_SCHEMA_VERSION = 2
+# Bump when the cached row shape changes (v2: interest/embedded tax parsed from each row's detail panel;
+# v3: v2 caches still held pre-panel-parsing rows with no interest for early 2025, forcing a full refetch).
+XIRR_CACHE_SCHEMA_VERSION = 3
 XIRR_CASHFLOWS_STATE_DEFAULT = {"rows": [], "last_fetched_date": None, "schema_version": XIRR_CACHE_SCHEMA_VERSION}
 # Rows can be posted days after their own date, so re-fetch this many days before the cache frontier.
 XIRR_CACHE_OVERLAP_DAYS = 30
@@ -782,6 +783,30 @@ def get_cached_operations(session: requests.Session, end_date: date) -> list:
     return merged
 
 
+def _day_end_balances(rows: list) -> list:
+    """[(day, closing 'Solde indicatif')] ascending. Same-day rows have no reliable order in the cache,
+    so each day's sequence is rebuilt by chaining balance == previous balance + amount."""
+    by_day = {}
+    for r in rows:
+        if r.get("date") and r.get("balance") is not None:
+            by_day.setdefault(r["date"], []).append(r)
+    result = []
+    current = 0.0
+    for day in sorted(by_day):
+        remaining = list(by_day[day])
+        while remaining:
+            nxt = next(
+                (r for r in remaining if abs(current + (_parse_amount(r.get("amountText")) or 0.0) - r["balance"]) <= 0.011),
+                None,
+            )
+            if nxt is None:
+                nxt = remaining[-1]
+            remaining.remove(nxt)
+            current = nxt["balance"]
+        result.append((day, current))
+    return result
+
+
 def compute_average_idle_cash(rows: list, start_date: str, end_date: str) -> float:
     """Day-weighted average uninvested-cash balance across [start_date,
     end_date] ("YYYY-MM-DD" strings). Unlike
@@ -800,10 +825,7 @@ def compute_average_idle_cash(rows: list, start_date: str, end_date: str) -> flo
     row is available at all (e.g. before the account's very first
     transaction).
     """
-    dated_balances = sorted(
-        ((r["date"], r["balance"]) for r in rows if r.get("date") and r.get("balance") is not None),
-        key=lambda t: t[0],
-    )
+    dated_balances = _day_end_balances(rows)
     if not dated_balances:
         return 0.0
 
@@ -846,10 +868,7 @@ def _balance_as_of(rows: list, as_of_date: date) -> float:
     backfilled month's "solde disponible" (see module docstring's
     2026-09-07 backward-reconstruction addition)."""
     as_of_str = as_of_date.strftime("%Y-%m-%d")
-    dated_balances = sorted(
-        ((r["date"], r["balance"]) for r in rows if r.get("date") and r.get("balance") is not None),
-        key=lambda t: t[0],
-    )
+    dated_balances = _day_end_balances(rows)
     balance = 0.0
     for day_str, bal in dated_balances:
         if day_str > as_of_str:
@@ -1282,7 +1301,7 @@ def run() -> None:
         skip_total=not current_month,
     )
 
-    # "prime" now gets the real "Bonus" transaction total (see above -
+    # "Bonus" now gets the real "Bonus" transaction total (see above -
     # replaces the old placeholder). "prélèvements" (withholding tax on
     # interest, real figure - see fetch_current_month_interest_totals())
     # is a separate sub-row in the same block, right before "Rendements %"
@@ -1300,7 +1319,7 @@ def run() -> None:
     # value to actually land somewhere - this script fills an existing
     # row by label, it doesn't insert new labelled rows into this block.
     bonus_breakdown = {
-        "prime": interest_totals["bonus_cashback_contest"],
+        "Bonus": interest_totals["bonus_cashback_contest"],
         "prélèvements": interest_totals["withholding_tax"],
     }
     if rendement_brut_value is not None:
