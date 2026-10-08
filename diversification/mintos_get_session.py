@@ -73,6 +73,7 @@ the fetched data to the Sheet.
 """
 
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -113,8 +114,12 @@ def _find_chrome() -> str:
     for path in CHROME_CANDIDATES:
         if os.path.exists(path):
             return path
+    for name in ("google-chrome", "google-chrome-stable"):
+        path = shutil.which(name)
+        if path:
+            return path
     raise RuntimeError(
-        f"Could not find chrome.exe in any of: {CHROME_CANDIDATES}. "
+        f"Could not find Chrome in any of: {CHROME_CANDIDATES} or on PATH (google-chrome). "
         "Install Google Chrome, or edit CHROME_CANDIDATES in this file."
     )
 
