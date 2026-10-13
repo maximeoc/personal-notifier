@@ -1,0 +1,221 @@
+"""LOCAL-ONLY helper: opens your REAL Chrome (a plain OS process, NOT
+launched through Playwright) on lande.finance's login page so YOU log in
+by hand, then automatically takes over once you're logged in - it
+captures the resulting session cookies and immediately runs the full
+lande_diversification.py fetch + Google Sheet update using that fresh
+session, with no copy-pasting required.
+
+Why login is manual here, AND why it's launched so differently from every
+other *_get_session.py in this repo (e.g. mintos_get_session.py, which
+just opens a normal headed Playwright browser): lande.finance's login page
+is protected by a Cloudflare Turnstile "I'm not a robot" managed challenge
+that DETECTS Playwright/CDP-driven automation specifically and loops the
+challenge forever - confirmed 2026-07-29 across TWO separate mitigation
+attempts (plain bundled Chromium; real Chrome via `channel="chrome"` PLUS
+this repo's shared/browser_stealth.py anti-detection patches), both
+failed identically. The block is tied to Playwright's CDP launch/automation
+signature itself (same category as the Go & Grow Keycloak block documented
+elsewhere in this repo before ITS pure-HTTP rewrite), not a UA/fingerprint
+-level tell fixable via JS patches - so no amount of stealth-patching a
+Playwright-launched browser can get past it.
+
+WORKAROUND (verified working 2026-07-29): launch the user's REAL,
+already-installed Chrome as a plain `subprocess.Popen(...)` (completely
+outside Playwright's control - no `--enable-automation`, no CDP launch
+signature at all) with `--remote-debugging-port` and a dedicated
+`--user-data-dir` (kept, not a temp dir, so a future run may not always
+need a fresh full manual login if Cloudflare's clearance/session persists
+- unverified how long that lasts). The user only needs to solve the
+Turnstile "I'm not a robot" checkbox by hand in that genuinely
+non-automated window - ONLY AFTER that does this script attach via
+Playwright's `connect_over_cdp()`, verified 2026-07-29 to work fine for
+filling/submitting the login form + 2FA code (not just reading cookies
+afterward as originally assumed) - the already-granted `cf_clearance`
+cookie is apparently what matters, not whether a CDP session is attached
+for the rest of the page's lifetime.
+
+Usage: `python -m diversification.lande_get_session`
+1. Your real Chrome opens (a separate profile, not your everyday one) on
+   the Lande login page.
+2. Solve ONLY the "I'm not a robot" checkbox yourself, leave the email/
+   password fields blank, then come back here and press Enter.
+3. The script attaches via CDP and fills/submits email+password
+   (LANDE_EMAIL/LANDE_PASSWORD) and, if a 2FA page appears, the TOTP code
+   (LANDE_TOTP_SECRET) - fully automatic from here. If any step doesn't
+   land where expected (wrong credentials, unexpected page), it tells you
+   and waits for you to sort it out by hand in the same window before
+   pressing Enter again.
+4. Once logged in, it captures the 3 needed cookies and immediately calls
+   `lande_diversification.run(session=...)` - the account's current data
+    is fetched and written to the Google Sheet right away. Cookie values
+    remain in memory and are never printed by this helper.
+
+Lande's cf_clearance/session cookie lifetimes are NOT specifically
+characterized yet (unlike Mintos's confirmed self-renewing sliding
+window) - if the scheduled job's run eventually fails with a "session
+expired" error (see lande_diversification.py), just re-run this script.
+
+Required env vars: LANDE_EMAIL, LANDE_PASSWORD, LANDE_TOTP_SECRET (used
+only locally by this helper to fill the login/2FA forms - never sent
+anywhere but Lande's own login form) - GOOGLE_SHEET_ID/GOOGLE_CREDENTIALS
+are still needed (transitively, by lande_diversification.run()) to write
+the fetched data to the Sheet.
+"""
+
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import logging
+
+import pyotp
+import requests
+from dotenv import load_dotenv
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
+from diversification.lande_diversification import run as run_diversification
+from shared.browser_stealth import human_mouse_wander, human_pause, human_type
+from shared.report_date import REPORT_DATE_ENV_VAR, get_report_date_list
+
+load_dotenv()
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("lande_get_session")
+
+LOGIN_URL = "https://lande.finance/login"
+DEBUG_PORT = 9333
+CHROME_CANDIDATES = [
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+]
+PROFILE_DIR = os.path.join(tempfile.gettempdir(), "lande_get_session_chrome_profile")
+
+LANDE_EMAIL = os.environ.get("LANDE_EMAIL")
+LANDE_PASSWORD = os.environ.get("LANDE_PASSWORD")
+LANDE_TOTP_SECRET = os.environ.get("LANDE_TOTP_SECRET")
+
+
+def _find_chrome() -> str:
+    for path in CHROME_CANDIDATES:
+        if os.path.exists(path):
+            return path
+    for name in ("google-chrome", "google-chrome-stable"):
+        path = shutil.which(name)
+        if path:
+            return path
+    raise RuntimeError(
+        f"Could not find Chrome in any of: {CHROME_CANDIDATES} or on PATH (google-chrome). "
+        "Install Google Chrome, or edit CHROME_CANDIDATES in this file "
+        "with your real Chrome path."
+    )
+
+
+def build_session_from_cookies(cookies: dict) -> requests.Session:
+    session = requests.Session()
+    session.headers.update({"User-Agent": "Mozilla/5.0"})
+    session.cookies.set("cf_clearance", cookies["cf_clearance"], domain=".lande.finance", path="/")
+    session.cookies.set("lande_session", cookies["lande_session"], domain=".lande.finance", path="/")
+    session.cookies.set("XSRF-TOKEN", cookies["XSRF-TOKEN"], domain=".lande.finance", path="/")
+    return session
+
+
+def _submit_credentials(page) -> None:
+    human_type(page.locator("#inp-email"), LANDE_EMAIL)
+    human_pause()
+    human_type(page.locator("#password"), LANDE_PASSWORD)
+    human_pause(0.3, 0.9)
+    page.locator("form#login button[type='submit']").click()
+    try:
+        page.wait_for_url(lambda u: "/login" not in u, timeout=20000)
+    except PlaywrightTimeoutError:
+        log.warning("Still on /login after submitting credentials (wrong password? already on a CAPTCHA retry?) - current URL: %s", page.url)
+
+
+def _submit_totp(page) -> bool:
+    """Tries 3 candidate TOTP codes (current/previous/next 30s window, same
+    resilience pattern as afranga_diversification.py/lendermarket_monitor.py)
+    against the 2FA form. Returns True once the page moves off /2fa."""
+    totp = pyotp.TOTP(LANDE_TOTP_SECRET)
+    now = int(time.time())
+    for candidate in (totp.at(now), totp.at(now - 30), totp.at(now + 30)):
+        human_type(page.locator("#two_factor_code"), candidate)
+        human_pause(0.3, 0.9)
+        page.locator("#two_factor_form_submit").click()
+        try:
+            page.wait_for_url(lambda u: "/2fa" not in u, timeout=8000)
+            return True
+        except PlaywrightTimeoutError:
+            continue
+    return False
+
+
+def main() -> None:
+    chrome_path = _find_chrome()
+    log.info("Launching real Chrome (%s) with a separate profile, remote debugging on :%s ...", chrome_path, DEBUG_PORT)
+    subprocess.Popen([
+        chrome_path,
+        f"--remote-debugging-port={DEBUG_PORT}",
+        f"--user-data-dir={PROFILE_DIR}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        LOGIN_URL,
+    ])
+    time.sleep(2)
+
+    input(
+        "\nA real Chrome window should now be open. Please solve ONLY the "
+        "'I'm not a robot' checkbox (leave email/password blank), THEN come "
+        "back here and press Enter...\n"
+    )
+
+    with sync_playwright() as p:
+        browser = p.chromium.connect_over_cdp(f"http://localhost:{DEBUG_PORT}")
+        context = browser.contexts[0]
+        page = context.pages[0] if context.pages else context.new_page()
+        human_mouse_wander(page)
+
+        if "/login" in page.url and LANDE_EMAIL and LANDE_PASSWORD:
+            log.info("Filling email/password automatically...")
+            _submit_credentials(page)
+
+        if "/2fa" in page.url and LANDE_TOTP_SECRET:
+            log.info("Filling 2FA code automatically...")
+            if not _submit_totp(page):
+                log.warning("All 3 TOTP candidates were rejected.")
+
+        if "/login" in page.url or "/2fa" in page.url:
+            input(
+                f"\nStill on {page.url} - please finish logging in manually "
+                "in the browser window, THEN come back here and press Enter...\n"
+            )
+
+        raw_cookies = context.cookies()
+        # Don't close the browser (it's the user's real Chrome process) -
+        # just disconnect Playwright from it.
+        browser.close()
+
+    wanted = {c["name"]: c["value"] for c in raw_cookies if c["name"] in ("cf_clearance", "lande_session", "XSRF-TOKEN")}
+    missing = [name for name in ("cf_clearance", "lande_session", "XSRF-TOKEN") if name not in wanted]
+    if missing:
+        log.error("Could not find cookie(s) %s after login - got: %r", missing, list(wanted.keys()))
+        sys.exit(1)
+
+    session = build_session_from_cookies(wanted)
+    report_dates = get_report_date_list()
+    log.info("Session captured - reusing it for %d month(s) (no re-login needed)...", len(report_dates))
+    for i, report_date in enumerate(report_dates, start=1):
+        if report_date:
+            os.environ[REPORT_DATE_ENV_VAR] = report_date
+        else:
+            os.environ.pop(REPORT_DATE_ENV_VAR, None)
+        log.info("[%d/%d] Running the Lande diversification fetch for %s...", i, len(report_dates), report_date or "today")
+        run_diversification(session=session)
+
+    log.info("Done. The authenticated session was kept in memory; cookie values were not displayed or persisted.")
+
+
+if __name__ == "__main__":
+    main()
