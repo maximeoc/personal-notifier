@@ -849,5 +849,62 @@ def run() -> None:
         fill_geographic_repartition_amounts(loan_originators)
 
 
+def run_all_months() -> None:
+    """Fills the Sheet for EVERY month since the first deposit (one run() per month,
+    REPORT_DATE pointed at each month's last day), the real current month last."""
+    if not MONEFIT_EMAIL or not MONEFIT_PASSWORD:
+        log.error("MONEFIT_EMAIL and MONEFIT_PASSWORD environment variables are required.")
+        sys.exit(1)
+
+    session = requests.Session()
+    session.headers.update(_HEADERS)
+    login(session)
+
+    today = datetime.now(REPORT_TIMEZONE).date()
+    summaries = get_cached_monthly_summaries(session, today)
+    active_months = sorted(
+        key for key, s in summaries.items()
+        if s["deposits"] or s["withdrawals"] or s["opening_balance"] or s.get("closing_balance")
+    )
+    if not active_months:
+        log.error("No active month found in the Monefit history.")
+        sys.exit(1)
+
+    year, month = (int(part) for part in active_months[0].split("-"))
+    log.info("Backfilling Monefit from %04d-%02d through %04d-%02d.", year, month, today.year, today.month)
+
+    previous_report_date = os.environ.get("REPORT_DATE")
+    failed_months = []
+    try:
+        while (year, month) <= (today.year, today.month):
+            label = f"{month:02d}/{year}"
+            if (year, month) == (today.year, today.month):
+                os.environ.pop("REPORT_DATE", None)
+            else:
+                last_day = calendar.monthrange(year, month)[1]
+                os.environ["REPORT_DATE"] = f"{last_day:02d}/{month:02d}/{year}"
+
+            log.info("=== Monefit %s ===", label)
+            try:
+                run()
+            except SystemExit:
+                log.error("Monefit run failed for %s - continuing with the next month.", label)
+                failed_months.append(label)
+
+            year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+    finally:
+        if previous_report_date is None:
+            os.environ.pop("REPORT_DATE", None)
+        else:
+            os.environ["REPORT_DATE"] = previous_report_date
+
+    if failed_months:
+        log.error("Months that failed: %s", ", ".join(failed_months))
+        sys.exit(1)
+
+
 if __name__ == "__main__":
-    run()
+    if "--all-months" in sys.argv[1:]:
+        run_all_months()
+    else:
+        run()

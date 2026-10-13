@@ -5,6 +5,7 @@ __pycache__/
 .env
 portfolio_imports/
 portfolio/sheet_metals.py
+portfolio/backfill_history.py
 error_screenshot.png
 swaper_storage_state.json
 swaper_state.json
@@ -17,6 +18,8 @@ peerberry_diversification_storage_state.json
 lendermarket_diversification_storage_state.json
 afranga_diversification_storage_state.json
 bricks_diversification_storage_state.json
+
+Appsscripts/
 
 # Catch-all: any current/future *_storage_state.json / *_state.json file
 # (session cookies / seen-loan-ID state) should never be committed.

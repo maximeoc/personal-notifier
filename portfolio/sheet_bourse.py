@@ -36,10 +36,9 @@ def _num(text: str) -> float:
     return float(text.replace("\xa0", "").replace(" ", "").replace("€", "").replace(",", "."))
 
 
-def load_trades(ledger_path: Path) -> dict:
-    """{(isin, 'YYYY-MM', side): [shares, amount, fees]} from the ledger."""
+def iter_trades(ledger_path: Path):
+    """Yield (isin, 'YYYY-MM-DD', side, shares, price, fees) for every executed trade of the ledger."""
     ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
-    trades: dict = collections.defaultdict(lambda: [0.0, 0.0, 0.0])
     for entry in ledger.values():
         item = entry["item"]
         if item.get("eventType") not in ("TRADING_TRADE_EXECUTED", "TRADING_SAVINGSPLAN_EXECUTED"):
@@ -56,7 +55,14 @@ def load_trades(ledger_path: Path) -> dict:
         shares, price = _num(shares_text), _num(price_text)
         fees = 0.0 if info.get("Frais") in (None, "Gratuit") else _num(info["Frais"])
         side = "sell" if "vente" in str(item.get("subtitle", "")).lower() else "buy"
-        bucket = trades[(match.group(1), item["timestamp"][:7], side)]
+        yield match.group(1), item["timestamp"][:10], side, shares, price, fees
+
+
+def load_trades(ledger_path: Path) -> dict:
+    """{(isin, 'YYYY-MM', side): [shares, amount, fees]} from the ledger."""
+    trades: dict = collections.defaultdict(lambda: [0.0, 0.0, 0.0])
+    for isin, day, side, shares, price, fees in iter_trades(ledger_path):
+        bucket = trades[(isin, day[:7], side)]
         bucket[0] += shares
         bucket[1] += shares * price
         bucket[2] += fees
