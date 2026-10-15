@@ -221,6 +221,7 @@ except ModuleNotFoundError:
     from shared.report_date import get_report_now, is_current_month
 
 from shared.session_cache import get_or_refresh_session
+from shared.loan_durations import durations_from_json_items, record_platform_loan_durations
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
 from shared.monthly_yield_waterfall import compute_monthly_yield_shares
@@ -431,9 +432,13 @@ def fetch_current_month_revenue_totals(session: requests.Session) -> dict:
     }
 
 
-def fetch_active_project_geo_amounts(session: requests.Session, all_entries: list = None) -> tuple:
+def fetch_active_project_geo_amounts(session: requests.Session, all_entries: list = None,
+                                     duration_items: list | None = None) -> tuple:
     """Projets Bricks en cours sous la forme ``(project_amounts, project_statuses)`` :
     ``{nom: {pays: capital restant}}`` et ``{nom: "current"|"delay"|"default"}``.
+
+    Si ``duration_items`` (liste) est fourni, chaque projet y est ajouté sous la forme
+    ``(objet JSON du projet, capital restant)`` pour le calcul de la durée des prêts.
 
     Source : ``GET /investor/portfolio/properties`` (la page "Mes projets"), qui renvoie ``ongoing``/``refunded``
     et ``total.value`` (centimes = "Investissements en cours"). ``brickPrice`` est arrondi à l'euro près après un
@@ -470,6 +475,8 @@ def fetch_active_project_geo_amounts(session: requests.Session, all_entries: lis
             amount = round(float(project.get("brickCount") or 0) * float(project.get("brickPrice") or 0) / 100, 2)
         if not name or amount <= 0:
             continue
+        if duration_items is not None:
+            duration_items.append((project, amount))
         country = (project.get("country") or "").strip()
         countries = project_amounts.setdefault(name, {})
         countries[country] = round(countries.get(country, 0.0) + amount, 2)
@@ -1101,8 +1108,9 @@ def run() -> None:
     # "Répartition géographique" : une ligne par projet (statut en sections, pays en colonne, comme Lande) ;
     # la ligne "Bricks" en est la somme. Relevés LIVE (sans date) : mois courant uniquement.
     if current_month:
+        duration_items = []
         try:
-            project_amounts, project_statuses = fetch_active_project_geo_amounts(session, all_entries)
+            project_amounts, project_statuses = fetch_active_project_geo_amounts(session, all_entries, duration_items)
             for issue in fill_bricks_project_geo_amounts(project_amounts, project_statuses):
                 log.warning("Bricks geographic breakdown: %s", issue)
         except Exception:
@@ -1111,6 +1119,10 @@ def run() -> None:
             fill_geographic_repartition_uninvested_amount("Bricks", balances["solde_total"])
         except Exception:
             log.exception("Failed to update Bricks' 'non investi' row.")
+        if duration_items:
+            record_platform_loan_durations(
+                "Bricks", "Crowdfunding immobilier", lambda: durations_from_json_items(duration_items),
+            )
 
 
 if __name__ == "__main__":

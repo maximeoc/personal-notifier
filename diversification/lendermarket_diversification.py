@@ -167,6 +167,7 @@ from shared.google_sheet import (
     fill_geographic_repartition_amounts,
     fill_geographic_repartition_uninvested_amount,
 )
+from shared.loan_durations import durations_from_json_items, parse_amount, record_platform_loan_durations
 from shared.report_date import get_report_now, is_current_month
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
@@ -925,6 +926,11 @@ def run() -> None:
         # already relied on elsewhere in this repo to gate the invest bot.
         if available_balance is not None:
             fill_geographic_repartition_uninvested_amount("Lendermarket", available_balance)
+
+        record_platform_loan_durations(
+            "Lendermarket", "Crowdlending",
+            lambda: durations_from_json_items((inv, parse_amount(inv.get("remainingPrincipal"))) for inv in investments),
+        )
 
 
 if __name__ == "__main__":

@@ -214,6 +214,7 @@ from shared.google_sheet import (
     fill_geographic_repartition_uninvested_amount,
     fill_lande_loan_geo_amounts,
 )
+from shared.loan_durations import durations_from_table, record_platform_loan_durations
 from shared.report_date import get_report_date, is_current_month
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
 from shared.monthly_yield_waterfall import compute_monthly_yield_shares
@@ -581,10 +582,11 @@ class _InvestmentTableParser(HTMLParser):
     def handle_starttag(self, tag, attrs):
         attributes = dict(attrs)
         if tag == "tr":
-            self.row = {"cells": [], "links": []}
+            self.row = {"cells": [], "links": [], "th": 0, "td": 0}
         elif tag in ("td", "th") and self.row is not None:
             self.cell = []
             self.row["cells"].append(self.cell)
+            self.row[tag] += 1
         elif tag == "a" and self.row is not None:
             href = attributes.get("href")
             if href:
@@ -603,13 +605,16 @@ class _InvestmentTableParser(HTMLParser):
             self.row = None
 
 
-def fetch_active_loan_geo_amounts(session: requests.Session) -> tuple:
+def fetch_active_loan_geo_amounts(session: requests.Session, duration_rows: dict | None = None) -> tuple:
     """Fetch current Lande investments as ``(loan_amounts, loan_statuses)``
     where ``loan_amounts`` is ``loan id -> country -> remaining principal``
     and ``loan_statuses`` is ``loan id -> payment_status filter``.
     The site's current-investments table contains
     one parent row per loan followed by one detail row per investment
     contract; several contracts for the same loan are summed together.
+    If ``duration_rows`` (dict) is given, it receives the table's column
+    headers (``"headers"``) and each loan's parent-row cells (``"cells"``:
+    loan id -> texts), used for the loan-duration tab.
     """
     loan_amounts = {}
     loan_statuses = {}
@@ -624,7 +629,7 @@ def fetch_active_loan_geo_amounts(session: requests.Session) -> tuple:
         if not response.ok:
             raise RuntimeError(f"Lande investments page returned status {response.status_code}")
         page_amounts = {}
-        parent_rows += _parse_investments_page(response.text, page_amounts)
+        parent_rows += _parse_investments_page(response.text, page_amounts, duration_rows)
         loan_amounts.update(page_amounts)
         # Le filtre « current » liste aussi les prêts en retard : les filtres suivants, plus précis, écrasent son statut.
         for loan_id in page_amounts:
@@ -645,12 +650,14 @@ def fetch_active_loan_geo_amounts(session: requests.Session) -> tuple:
     return loan_amounts, loan_statuses
 
 
-def _parse_investments_page(page_html: str, loan_amounts: dict) -> int:
-    """Ajoute dans `loan_amounts` les prêts non remboursés de la page ; retourne le nombre de lignes prêt."""
+def _parse_investments_page(page_html: str, loan_amounts: dict, duration_rows: dict | None = None) -> int:
+    """Ajoute dans `loan_amounts` les prêts non remboursés de la page ; retourne le nombre de lignes prêt.
+    Si `duration_rows` est fourni, y range les intitulés du tableau et les cellules de chaque ligne prêt."""
     parser = _InvestmentTableParser()
     parser.feed(page_html)
     current_loan = None
     parent_rows = 0
+    pending_headers = []
 
     def save_current_loan():
         if current_loan and current_loan["amount"] > 0:
@@ -663,10 +670,17 @@ def _parse_investments_page(page_html: str, loan_amounts: dict) -> int:
             (match.group(1) for link in row["links"] if (match := _LOAN_ID_RE.search(link))),
             None,
         )
+        # Ligne d'intitulés (que des <th>) : mémorisée pour la durée des prêts, traitement inchangé ensuite.
+        if row.get("th") and not row.get("td") and not loan_id:
+            pending_headers = row["cells"]
         if loan_id:
             save_current_loan()
             parent_rows += 1
             cells = row["cells"]
+            if duration_rows is not None:
+                if pending_headers and not duration_rows.get("headers"):
+                    duration_rows["headers"] = pending_headers
+                duration_rows.setdefault("cells", {})[loan_id] = cells
             status = cells[3].casefold() if len(cells) > 3 else ""
             country_code = cells[4].strip().upper() if len(cells) > 4 else ""
             if "rembours" in status:
@@ -760,13 +774,27 @@ def run(session: requests.Session | None = None) -> None:
     # La ligne "Lande" est une formule de somme de ses sous-lignes, gérée par fill_lande_loan_geo_amounts.
     available_funds = None
     if current_month:
+        duration_rows = {}
+        active_loan_amounts = {}
         try:
-            active_loan_amounts, loan_statuses = fetch_active_loan_geo_amounts(session)
+            active_loan_amounts, loan_statuses = fetch_active_loan_geo_amounts(session, duration_rows)
             geo_issues = fill_lande_loan_geo_amounts(active_loan_amounts, loan_statuses)
             for issue in geo_issues:
                 log.warning("Lande geographic breakdown: %s", issue)
         except Exception:
             log.exception("Failed to fetch/update Lande's active-loan geographic breakdown.")
+
+        if active_loan_amounts:
+            record_platform_loan_durations(
+                PLATFORM_LABEL, "Crowdlending",
+                lambda: durations_from_table(
+                    duration_rows.get("headers") or [],
+                    [
+                        (duration_rows.get("cells", {}).get(loan_id, []), sum(countries.values()))
+                        for loan_id, countries in active_loan_amounts.items()
+                    ],
+                ),
+            )
 
         try:
             available_funds = fetch_available_funds(session)

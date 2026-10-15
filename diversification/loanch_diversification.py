@@ -221,6 +221,7 @@ from shared.google_sheet import (
     fill_geographic_repartition_amounts,
     fill_geographic_repartition_uninvested_amount,
 )
+from shared.loan_durations import durations_from_json_items, parse_amount, record_platform_loan_durations
 from shared.report_date import get_report_now, is_current_month
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
@@ -413,7 +414,10 @@ def fetch_investments(session: requests.Session) -> list:
         r = session.get(f"{INVESTMENTS_API_URL}/{inv['id']}", headers=_HEADERS, timeout=20)
         if not r.ok:
             raise RuntimeError(f"Investment detail API returned status {r.status_code} for {inv['id']}")
-        inv["principal_left"] = (r.json() or {}).get("principal_left")
+        detail = r.json() or {}
+        inv["principal_left"] = detail.get("principal_left")
+        # Détail complet conservé : sert aussi à la durée des prêts (shared.loan_durations).
+        inv["detail"] = detail
         if i % 20 == 0 or i == len(investments):
             log.info("Fetched detail for %d/%d investment(s) so far.", i, len(investments))
 
@@ -1340,6 +1344,13 @@ def run() -> None:
 
         if uninvested_balance is not None:
             fill_geographic_repartition_uninvested_amount("Loanch", uninvested_balance)
+
+        record_platform_loan_durations(
+            "Loanch", "Crowdlending",
+            lambda: durations_from_json_items(
+                ({**inv, **(inv.get("detail") or {})}, parse_amount(inv.get("principal_left"))) for inv in investments
+            ),
+        )
 
 
 if __name__ == "__main__":

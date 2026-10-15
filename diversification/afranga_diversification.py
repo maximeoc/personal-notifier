@@ -174,6 +174,9 @@ from shared.google_sheet import (
     fill_geographic_repartition_amounts,
     fill_geographic_repartition_uninvested_amount,
 )
+from shared.loan_durations import (
+    durations_from_table, record_platform_loan_durations, strip_html, table_headers_from_html,
+)
 from shared.report_date import get_report_now, is_current_month
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
@@ -330,6 +333,7 @@ def fetch_investments(session: requests.Session) -> list:
     r = session.get(MY_INVESTMENTS_URL, headers=_HEADERS, timeout=20)
     r.raise_for_status()
     token = _extract_csrf_token(r.text)
+    page_headers = table_headers_from_html(r.text)
 
     log.info("Requesting My investments refresh endpoint (limit=%d)...", MAX_LIMIT)
     r = session.get(
@@ -354,6 +358,8 @@ def fetch_investments(session: requests.Session) -> list:
     tbody_html = tbody_m.group(1) if tbody_m else ""
     raw_rows = re.findall(r"<tr[^>]*>(.*?)</tr>", tbody_html, re.DOTALL)
     log.info("Parsed %d raw row(s) from the My investments table (before filtering the Total row).", len(raw_rows))
+    # Intitulés des colonnes (durée des prêts) : ceux du fragment s'il en a, sinon ceux de la page complète.
+    table_headers = table_headers_from_html(r.text) or page_headers
 
     investments = []
     for row_html in raw_rows:
@@ -371,6 +377,8 @@ def fetch_investments(session: requests.Session) -> list:
             {
                 "originator": originator_m.group(1),
                 "outstanding": _parse_amount(outstanding_m.group(1) if outstanding_m else None),
+                "cells": [strip_html(cell) for cell in cells],
+                "table_headers": table_headers,
             }
         )
 
@@ -1729,6 +1737,14 @@ def run() -> None:
         fill_geographic_repartition_amounts(loan_originators, platform="Afranga")
         if uninvested_balance is not None:
             fill_geographic_repartition_uninvested_amount("Afranga", uninvested_balance)
+
+        record_platform_loan_durations(
+            "Afranga", "Crowdlending",
+            lambda: durations_from_table(
+                investments[0]["table_headers"] if investments else [],
+                [(inv["cells"], inv["outstanding"]) for inv in investments],
+            ),
+        )
 
 
 if __name__ == "__main__":

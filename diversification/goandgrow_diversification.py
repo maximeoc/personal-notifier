@@ -115,6 +115,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts
+from shared.loan_durations import record_constant_duration
 from shared.report_date import get_report_now, is_current_month
 from shared.session_cache import get_or_refresh_session
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
@@ -692,6 +693,10 @@ def run() -> None:
 
     if current_month:
         fill_geographic_repartition_amounts([{"name": PLATFORM_LABEL, "amount": balance}])
+        record_constant_duration(
+            PLATFORM_LABEL, "Crowdlending savings", 0, balance,
+            "épargne retirable à tout moment, pas de prêts individuels",
+        )
 
 
 if __name__ == "__main__":

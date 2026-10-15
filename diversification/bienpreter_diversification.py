@@ -227,6 +227,7 @@ from shared.google_sheet import (
     fill_bienpreter_borrower_geo_amounts,
     fill_geographic_repartition_uninvested_amount,
 )
+from shared.loan_durations import durations_from_labelled_pages, record_platform_loan_durations
 from shared.report_date import get_report_now, is_current_month
 from shared.session_cache import get_or_refresh_session
 from shared.notifier import send_bienpreter_geo_issues_email
@@ -413,6 +414,8 @@ LOAN_PROJECT_BORROWER_REGEX = re.compile(
 )
 LOAN_AMOUNT_REGEX = re.compile(r'contract__amount[^"]*">\s*([^<]+?)\s*</td>', re.DOTALL)
 PROJECT_LOCATION_REGEX = re.compile(r"<dt>\s*Localisation\s*</dt>\s*<dd[^>]*>(.*?)</dd>", re.DOTALL)
+# Toutes les paires intitulé / valeur d'une fiche projet (durée, échéance...) pour l'onglet « durées prêts ».
+PROJECT_LABEL_PAIR_REGEX = re.compile(r"<dt[^>]*>(.*?)</dt>\s*<dd[^>]*>(.*?)</dd>", re.DOTALL)
 # "<p class=\"text-center\">\n    24\n    r\u00e9sultats au total\n  </p>" - used to bound
 # pagination reliably instead of "stop on an empty page", since out-of-
 # range pages on this site don't reliably come back empty (same bug
@@ -545,16 +548,24 @@ def _country_from_location(location: str):
     return None
 
 
-def fetch_project_country(session: requests.Session, project_id: str):
+def fetch_project_country(session: requests.Session, project_id: str, labels_out: dict | None = None):
     """Fetches https://www.bienpreter.com/projets/{project_id} and reads
     the '<dt>Localisation</dt><dd>...</dd>' pair, returning just the
     country part via _country_from_location(). Returns None if the
-    location can't be found/parsed."""
+    location can't be found/parsed. If `labels_out` (dict) is given, it
+    also receives every '<dt>label</dt><dd>value</dd>' pair of the page as
+    plain text (used for the loan-duration tab, no extra request)."""
     url = f"https://www.bienpreter.com/projets/{project_id}"
     log.info("GET project page %s (for country)...", project_id)
     r = session.get(url, timeout=30)
     log.info("GET project page %s: status=%s", project_id, r.status_code)
     r.raise_for_status()
+
+    if labels_out is not None:
+        for label, value in PROJECT_LABEL_PAIR_REGEX.findall(r.text):
+            label_text = html.unescape(_strip_tags(label)).strip()
+            if label_text and label_text not in labels_out:
+                labels_out[label_text] = html.unescape(_strip_tags(value)).strip()
 
     match = PROJECT_LOCATION_REGEX.search(r.text)
     if not match:
@@ -567,7 +578,7 @@ def fetch_project_country(session: requests.Session, project_id: str):
     return country
 
 
-def fetch_active_loans_by_borrower(session: requests.Session):
+def fetch_active_loans_by_borrower(session: requests.Session, duration_pages: list | None = None):
     """Fetches every active loan (fetch_active_loans()) and its project's
     country (fetch_project_country(), cached per project_id since several
     contracts can point at the same project), then groups/sums by
@@ -590,18 +601,23 @@ def fetch_active_loans_by_borrower(session: requests.Session):
       found/fetched - feeds shared.notifier.send_bienpreter_geo_issues_email()
       (per explicit user request: any missing country or error here should
       be emailed, not just logged).
+    If `duration_pages` (list) is given, it receives one
+    ({project page label: value}, amount) pair per loan, for the
+    loan-duration tab (reuses the project pages already fetched).
     """
     loans, issues = fetch_active_loans(session)
 
     project_country_cache = {}
+    project_labels_cache = {}
     borrowers = {}
 
     for loan in loans:
         project_id = loan["project_id"]
         name = loan["borrower"]
         if project_id not in project_country_cache:
+            labels = project_labels_cache.setdefault(project_id, {})
             try:
-                country = fetch_project_country(session, project_id)
+                country = fetch_project_country(session, project_id, labels)
                 if country is None:
                     issues.append(
                         f"Pays introuvable sur la page du projet {project_id} (emprunteur '{name}')."
@@ -617,6 +633,8 @@ def fetch_active_loans_by_borrower(session: requests.Session):
         country = project_country_cache[project_id] or ""
         entry = borrowers.setdefault(name, {})
         entry[country] = entry.get(country, 0.0) + loan["amount"]
+        if duration_pages is not None:
+            duration_pages.append((project_labels_cache.get(project_id) or {}, loan["amount"]))
 
     log.info("Active loans grouped by borrower: %d borrower(s) found.", len(borrowers))
     return borrowers, issues
@@ -1359,14 +1377,20 @@ def run() -> None:
     geo_issues = []
     geo_error = None
     if current_month:
+        duration_pages = []
         try:
             log.info("Fetching active loans grouped by borrower (for the geographic breakdown)...")
-            borrowers, fetch_issues = fetch_active_loans_by_borrower(session)
+            borrowers, fetch_issues = fetch_active_loans_by_borrower(session, duration_pages)
             geo_issues.extend(fetch_issues)
             geo_issues.extend(fill_bienpreter_borrower_geo_amounts(borrowers))
         except Exception as exc:
             log.exception("Failed to update the Bienprêter geographic breakdown by borrower.")
             geo_error = str(exc)
+
+        if duration_pages:
+            record_platform_loan_durations(
+                "Bienprêter", "Crowdlending", lambda: durations_from_labelled_pages(duration_pages),
+            )
 
         # "non investi" row (added 2026-08-10): the same "solde disponible"
         # already scraped above for the Crowdlending section's "total".
