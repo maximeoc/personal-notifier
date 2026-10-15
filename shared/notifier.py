@@ -23,6 +23,44 @@ EMAIL_TO = os.environ.get("EMAIL_TO")
 _ORIGINATOR_FIELD_CANDIDATES = ("company", "loanOriginator", "originator", "originatorName", "group")
 
 
+def _fmt_bounds(low, high, unit: str) -> str:
+    if low is None and high is None:
+        return "-"
+    low_str = f"{low:g}" if low is not None else ""
+    high_str = f"{high:g}" if high is not None else ""
+    return f"{low_str}..{high_str}{unit}"
+
+
+def _robot_config_lines(config) -> list:
+    """Body section describing the "config robots" sheet settings used by a run
+    (shared.robot_config.PlatformConfig, duck-typed to keep this module free of
+    the Google Sheet import). Empty list if `config` is None."""
+    if config is None:
+        return []
+    lines = ["", "=== Config robot utilisée ==="]
+    country_pct = getattr(config, "country_max_pct", None)
+    lines.append(f"Plafond par pays : {country_pct:g}% du solde" if country_pct is not None else "Plafond par pays : aucun")
+    for loan in config.loans.values():
+        if not (loan.active or loan.secondary_active):
+            continue
+        markets = "/".join(m for m, on in (("primaire", loan.active), ("secondaire", loan.secondary_active)) if on)
+        parts = [
+            f"taux {_fmt_bounds(loan.min_rate, loan.max_rate, '%')}",
+            f"montant {_fmt_bounds(loan.min_amount, loan.max_amount, ' €')}",
+            f"plafond loan {loan.max_loan_pct:g}%" if loan.max_loan_pct is not None else "plafond loan -",
+        ]
+        if loan.equal_split:
+            parts.append("répartition équivalente")
+        if loan.secondary_active:
+            parts.append(f"durée restante {_fmt_bounds(loan.min_months, loan.max_months, ' mois')}")
+            parts.append(f"décote/prime {_fmt_bounds(loan.min_premium, loan.max_premium, '%')}")
+        country = f" ({loan.country})" if loan.country else ""
+        lines.append(f"- {loan.name}{country} [{markets}] : " + " | ".join(parts))
+    if len(lines) == 3:
+        lines.append("Aucun loan actif.")
+    return lines
+
+
 def _format_loan(loan: dict) -> str:
     """Format a single loan as one line: identifier, originator, available
     amount, and yield (interest rate)."""
@@ -98,6 +136,7 @@ def send_swaper_investment_summary_email(
     originator_cap_status: dict | None = None,
     originator_blocked: list | None = None,
     error: str | None = None,
+    robot_config=None,
 ) -> None:
     """Send a summary of REAL Swaper investments made this run via the
     manual "+" button (see monitors.swaper_monitor._invest_available_loans()
@@ -233,6 +272,8 @@ def send_swaper_investment_summary_email(
             + ", ".join(originator_blocked)
         )
         body_lines.append("")
+    body_lines.extend(_robot_config_lines(robot_config))
+    body_lines.append("")
     body_lines.append(
         "La pi\u00e8ce jointe contient la requ\u00eate d'investissement r\u00e9elle envoy\u00e9e \u00e0 Swaper "
         "et sa r\u00e9ponse pour chaque pr\u00eat (v\u00e9rification d'approbation + achat) - m\u00e9thode/URL/"
@@ -412,7 +453,7 @@ def send_lendermarket_email(balance: float | None, segments: dict) -> None:
 
 
 
-def send_lendermarket_invest_summary_email(stats: dict, error: str | None = None, diagnostics_text: str | None = None) -> None:
+def send_lendermarket_invest_summary_email(stats: dict, error: str | None = None, diagnostics_text: str | None = None, robot_config=None) -> None:
     """Send the end-of-run recap for monitors/lendermarket_monitor.py's real
     auto-invest step (invest_selected_lenders(), added 2026-07-24). Only
     called when at least one real investment attempt was made this run, OR
@@ -516,6 +557,8 @@ def send_lendermarket_invest_summary_email(stats: dict, error: str | None = None
             + ", ".join(originator_blocked)
         )
 
+    body_parts.extend(_robot_config_lines(robot_config))
+
     if stats.get("invest_failures", 0) > 0 or error:
         body_parts.append("")
         body_parts.append(
@@ -548,7 +591,7 @@ def send_lendermarket_invest_summary_email(stats: dict, error: str | None = None
         log.exception("Failed to send Lendermarket invest bot summary email.")
 
 
-def send_afranga_invest_summary_email(stats: dict, error: str | None = None, diagnostics_text: str | None = None) -> None:
+def send_afranga_invest_summary_email(stats: dict, error: str | None = None, diagnostics_text: str | None = None, robot_config=None) -> None:
     """Recap of monitors/afranga_invest_bot.py. `stats["mode"]` is dry/probe/live;
     in dry/probe nothing is bought, the planned lines are listed and the
     diagnostics (requests/responses, review page structure) are attached."""
@@ -592,6 +635,7 @@ def send_afranga_invest_summary_email(stats: dict, error: str | None = None, dia
     if stats.get("invested"):
         body_parts += ["", "=== Investissements réussis ==="]
         body_parts += [f"- [{i['market']}] {i['loan']} : {i['amount']:.2f} €" for i in stats["invested"]]
+    body_parts.extend(_robot_config_lines(robot_config))
     if diagnostics_text:
         body_parts += ["", "Le détail complet (requêtes/réponses, structure des pages de confirmation) est joint."]
 
@@ -986,3 +1030,42 @@ def send_diversification_recap_email(amounts: dict, missing_platforms: list | No
         log.info("Diversification recap email sent to %s.", EMAIL_TO)
     except Exception:
         log.exception("Failed to send diversification recap email.")
+
+
+def send_new_bilans_email(new_bilans: list) -> None:
+    """Sent by scripts/sync_bilans_financiers.py when new bilan rows were added
+    to the "notes bilans" sheet. Each item: dict with owner, exercice, audit,
+    devise, ca_eur, resultat_net, note."""
+    if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO]):
+        log.error(
+            "SMTP configuration is incomplete; cannot send email. "
+            "Required env vars: SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO."
+        )
+        return
+
+    subject = f"[Bilans] {len(new_bilans)} nouveau(x) bilan(s) financier(s) ajouté(s)"
+    body_lines = ["Nouveaux bilans ajoutés dans l'onglet \"notes bilans\" :", ""]
+    for b in new_bilans:
+        note = f"{b['note']}/5" if b.get("note") != "" else "n/a"
+        ca = f"{b['ca_eur']} €" if b.get("ca_eur") != "" else "n/a"
+        result = f"{b['resultat_net']} {b['devise']}".strip() if b.get("resultat_net") != "" else "n/a"
+        body_lines.append(
+            f"- {b['owner']} - exercice {b['exercice']} ({b['audit']}) : "
+            f"CA {ca} | résultat net {result} | note {note}"
+        )
+    body = "\n".join(body_lines)
+
+    msg = MIMEMultipart()
+    msg["From"] = EMAIL_FROM
+    msg["To"] = EMAIL_TO
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
+        log.info("New bilans email sent to %s.", EMAIL_TO)
+    except Exception:
+        log.exception("Failed to send new bilans email.")
