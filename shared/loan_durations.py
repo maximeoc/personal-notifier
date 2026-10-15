@@ -54,6 +54,23 @@ class DurationExtraction:
     loans: list[LoanDuration]
     source: str = ""
     available_fields: list[str] | None = None
+    # Exemple de valeur des seuls champs dont le NOM évoque une date ou une durée (diagnostic, jamais de montant).
+    samples: dict[str, str] | None = None
+
+
+_SAMPLE_NAME_RE = re.compile(r"date|dur|term|month|mois|day|jour|end|fin|matur|period|year|annee|echeance|expir|remain|rest")
+
+
+def _samples_from_pairs(pairs: Iterable[tuple[str, object]]) -> dict[str, str]:
+    samples = {}
+    for name, value in pairs:
+        if len(samples) >= 20:
+            break
+        if isinstance(value, (dict, list)) or value in (None, ""):
+            continue
+        if _SAMPLE_NAME_RE.search(_key(name)) and not re.search(r"amount|montant|price|prix|balance|solde", _key(name)):
+            samples[str(name)] = str(value)[:40]
+    return samples
 
 
 # --------------------------------------------------------------------------
@@ -357,6 +374,7 @@ def durations_from_json_items(items: Iterable[tuple[dict, float]], today: date |
         loans=loans,
         source=_describe_sources(sources),
         available_fields=field_names(first) if first is not None else [],
+        samples=_samples_from_pairs((path, v) for path, _, v in _walk(first)) if first is not None else {},
     )
 
 
@@ -412,11 +430,15 @@ def durations_from_table(headers: list[str], rows: Iterable[tuple[list[str], flo
     columns = classify_headers(headers)
     loans: list[LoanDuration] = []
     used: dict[str, int] = {}
+    samples: dict[str, str] | None = None
 
     for cells, amount in rows:
         if not amount or amount <= 0:
             continue
         offset = max(0, len(cells) - len(headers))
+        if samples is None:
+            samples = _samples_from_pairs(
+                (header, cells[i + offset]) for i, header in enumerate(headers) if header and i + offset < len(cells))
 
         def cell(kind):
             index = columns.get(kind)
@@ -448,7 +470,8 @@ def durations_from_table(headers: list[str], rows: Iterable[tuple[list[str], flo
             key = ", ".join(source_parts)
             used[key] = used.get(key, 0) + 1
 
-    return DurationExtraction(loans=loans, source=_describe_sources(used), available_fields=[h for h in headers if h])
+    return DurationExtraction(loans=loans, source=_describe_sources(used), available_fields=[h for h in headers if h],
+                              samples=samples or {})
 
 
 def durations_from_labelled_pages(pages: Iterable[tuple[dict[str, str], float]],
@@ -458,18 +481,21 @@ def durations_from_labelled_pages(pages: Iterable[tuple[dict[str, str], float]],
     loans: list[LoanDuration] = []
     sources: dict[str, int] = {}
     fields: list[str] = []
+    samples: dict[str, str] | None = None
     for labels, amount in pages:
         headers = list(labels)
         for header in headers:
             if header not in fields:
                 fields.append(header)
+        if samples is None and labels:
+            samples = _samples_from_pairs(labels.items())
         result = durations_from_table(headers, [([labels[h] for h in headers], amount)], today)
         loans.extend(result.loans)
         if result.source:
             key = re.sub(r" \(\d+ prêts?\)$", "", result.source)
             sources[key] = sources.get(key, 0) + 1
     return DurationExtraction(loans=loans, source=_describe_sources(sources),
-                              available_fields=fields[:MAX_FIELD_NAMES_LOGGED])
+                              available_fields=fields[:MAX_FIELD_NAMES_LOGGED], samples=samples or {})
 
 
 def _describe_sources(sources: dict[str, int]) -> str:
@@ -588,8 +614,9 @@ def record_platform_loan_durations(platform: str, section: str, extract: Callabl
         if stats["nb_term"] == 0 and stats["nb_remaining"] == 0:
             logger.warning(
                 "Durées %s : aucun champ de durée reconnu sur %d prêt(s) - onglet '%s' non modifié. "
-                "Champs disponibles : %s",
+                "Champs disponibles : %s | Exemples (champs date/durée) : %s",
                 platform, len(loans), DURATIONS_SHEET_NAME, ", ".join(extraction.available_fields or []) or "(aucun)",
+                ", ".join(f"{k}={v}" for k, v in (extraction.samples or {}).items()) or "(aucun)",
             )
             return None
         source = f"{extraction.source} ; durée connue pour {stats['nb_term']}/{stats['nb']} prêts ({stats['couverture']} % de l'encours)"

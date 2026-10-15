@@ -1387,10 +1387,9 @@ def run() -> None:
             log.exception("Failed to update the Bienprêter geographic breakdown by borrower.")
             geo_error = str(exc)
 
-        if duration_pages:
-            record_platform_loan_durations(
-                "Bienprêter", "Crowdlending", lambda: durations_from_labelled_pages(duration_pages),
-            )
+        record_platform_loan_durations(
+            "Bienprêter", "Crowdlending", lambda: durations_from_labelled_pages(duration_pages),
+        )
 
         # "non investi" row (added 2026-08-10): the same "solde disponible"
         # already scraped above for the Crowdlending section's "total".

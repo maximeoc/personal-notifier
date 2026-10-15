@@ -1119,10 +1119,9 @@ def run() -> None:
             fill_geographic_repartition_uninvested_amount("Bricks", balances["solde_total"])
         except Exception:
             log.exception("Failed to update Bricks' 'non investi' row.")
-        if duration_items:
-            record_platform_loan_durations(
-                "Bricks", "Crowdfunding immobilier", lambda: durations_from_json_items(duration_items),
-            )
+        record_platform_loan_durations(
+            "Bricks", "Crowdfunding immobilier", lambda: durations_from_json_items(duration_items),
+        )
 
 
 if __name__ == "__main__":

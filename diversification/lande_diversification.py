@@ -784,17 +784,16 @@ def run(session: requests.Session | None = None) -> None:
         except Exception:
             log.exception("Failed to fetch/update Lande's active-loan geographic breakdown.")
 
-        if active_loan_amounts:
-            record_platform_loan_durations(
-                PLATFORM_LABEL, "Crowdlending",
-                lambda: durations_from_table(
-                    duration_rows.get("headers") or [],
-                    [
-                        (duration_rows.get("cells", {}).get(loan_id, []), sum(countries.values()))
-                        for loan_id, countries in active_loan_amounts.items()
-                    ],
-                ),
-            )
+        record_platform_loan_durations(
+            PLATFORM_LABEL, "Crowdlending",
+            lambda: durations_from_table(
+                duration_rows.get("headers") or [],
+                [
+                    (duration_rows.get("cells", {}).get(loan_id, []), sum(countries.values()))
+                    for loan_id, countries in active_loan_amounts.items()
+                ],
+            ),
+        )
 
         try:
             available_funds = fetch_available_funds(session)
