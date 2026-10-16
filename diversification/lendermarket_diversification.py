@@ -929,7 +929,11 @@ def run() -> None:
 
         record_platform_loan_durations(
             "Lendermarket", "Crowdlending",
-            lambda: durations_from_json_items((inv, parse_amount(inv.get("remainingPrincipal"))) for inv in investments),
+            # Une part achetée sur le marché secondaire : investmentDate n'est pas le début du prêt.
+            lambda: durations_from_json_items(
+                ((inv, parse_amount(inv.get("remainingPrincipal"))) for inv in investments),
+                use_investment_date=False,
+            ),
         )
 
 

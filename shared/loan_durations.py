@@ -254,9 +254,12 @@ _MATURITY_KEYS = {"maturitydate", "maturity", "finalpaymentdate", "lastpaymentda
                   "enddate", "loanenddate", "expectedenddate", "expectedrepaymentdate", "plannedenddate",
                   "maturityat", "dateend", "datefin", "dateecheance", "echeance", "lastinstallmentdate"}
 _START_KEYS = {"issuedate", "issueddate", "issuedat", "startdate", "loanstartdate", "disbursementdate",
-               "disbursedat", "fundeddate", "fundingdate", "listingdate", "investeddate", "investmentdate",
-               "investedat", "purchasedate", "purchasedat", "agreementdate", "contractdate", "datedebut",
-               "datedemission"}
+               "disbursedat", "fundeddate", "fundingdate", "listingdate", "agreementdate", "contractdate",
+               "datedebut", "datedemission", "originationdate", "originatedat", "loanissuedate", "signingdate"}
+# Dates de création : fiables seulement quand elles décrivent le prêt lui-même (chemin contenant « loan »).
+_LOAN_CREATED_KEYS = {"createdat", "createddate", "creationdate"}
+# Date où l'investisseur a acheté sa part : pas le début du prêt (rachat sur marché secondaire), donc dernier recours.
+_INVESTMENT_DATE_KEYS = {"investeddate", "investmentdate", "investedat", "purchasedate", "purchasedat"}
 
 
 def _walk(obj, path: str = "", depth: int = 0):
@@ -297,12 +300,18 @@ def _months_from_value_with_unit(value, siblings: dict) -> float | None:
     return None
 
 
-def extract_from_mapping(item: dict, today: date) -> tuple[float | None, float | None, str]:
-    """(durée initiale, durée restante, description des champs utilisés) d'un prêt JSON."""
+def extract_from_mapping(item: dict, today: date,
+                         use_investment_date: bool = True) -> tuple[float | None, float | None, str]:
+    """(durée initiale, durée restante, description des champs utilisés) d'un prêt JSON.
+
+    La date de début est choisie par priorité (début du prêt > création du prêt > date d'investissement) et non
+    par ordre d'apparition : sinon une date d'investissement de premier niveau masquerait celle du prêt.
+    `use_investment_date=False` ignore la date d'investissement (plateformes avec marché secondaire)."""
     term = remaining = None
     term_source = remaining_source = ""
-    maturity = start = None
-    maturity_path = start_path = ""
+    maturity = None
+    maturity_path = ""
+    start_candidates: list[tuple[int, str, date]] = []
 
     by_parent: dict[str, dict] = {}
     entries = list(_walk(item))
@@ -334,9 +343,22 @@ def extract_from_mapping(item: dict, today: date) -> tuple[float | None, float |
         if maturity is None and key in _MATURITY_KEYS:
             maturity = parse_date(value)
             maturity_path = path if maturity else ""
-        if start is None and key in _START_KEYS:
-            start = parse_date(value)
-            start_path = path if start else ""
+        if key in _START_KEYS:
+            priority = 0
+        elif key in _LOAN_CREATED_KEYS and "loan" in parent.lower():
+            priority = 1
+        elif use_investment_date and key in _INVESTMENT_DATE_KEYS:
+            priority = 2
+        else:
+            continue
+        parsed = parse_date(value)
+        if parsed:
+            start_candidates.append((priority, path, parsed))
+
+    start = None
+    start_path = ""
+    if start_candidates:
+        _, start_path, start = min(start_candidates, key=lambda c: c[0])
 
     if term is None and maturity and start:
         term = _valid_months(months_between(start, maturity))
@@ -355,7 +377,8 @@ def extract_from_mapping(item: dict, today: date) -> tuple[float | None, float |
     return term, remaining, ", ".join(sources)
 
 
-def durations_from_json_items(items: Iterable[tuple[dict, float]], today: date | None = None) -> DurationExtraction:
+def durations_from_json_items(items: Iterable[tuple[dict, float]], today: date | None = None,
+                              use_investment_date: bool = True) -> DurationExtraction:
     """`items` : (objet JSON du prêt, encours en EUR)."""
     today = today or date.today()
     loans: list[LoanDuration] = []
@@ -366,7 +389,7 @@ def durations_from_json_items(items: Iterable[tuple[dict, float]], today: date |
             first = item
         if not isinstance(item, dict) or not amount or amount <= 0:
             continue
-        term, remaining, source = extract_from_mapping(item, today)
+        term, remaining, source = extract_from_mapping(item, today, use_investment_date)
         loans.append(LoanDuration(amount=float(amount), term_months=term, remaining_months=remaining))
         if source:
             sources[source] = sources.get(source, 0) + 1
@@ -611,6 +634,13 @@ def record_platform_loan_durations(platform: str, section: str, extract: Callabl
             logger.info("Durées %s : aucun prêt en cours, rien à écrire.", platform)
             return None
         stats = compute_stats(loans)
+        if stats["nb_term"] == 0 and stats["nb_remaining"] > 0:
+            logger.info(
+                "Durées %s : durée initiale introuvable (seule la durée restante est connue). "
+                "Champs disponibles : %s | Exemples (champs date/durée) : %s",
+                platform, ", ".join(extraction.available_fields or []) or "(aucun)",
+                ", ".join(f"{k}={v}" for k, v in (extraction.samples or {}).items()) or "(aucun)",
+            )
         if stats["nb_term"] == 0 and stats["nb_remaining"] == 0:
             logger.warning(
                 "Durées %s : aucun champ de durée reconnu sur %d prêt(s) - onglet '%s' non modifié. "
