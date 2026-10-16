@@ -286,6 +286,7 @@ from shared.google_sheet import (
     fill_geographic_repartition_uninvested_amount,
 )
 from shared.report_date import get_report_date, is_current_month
+from shared.loan_durations import durations_from_json_items, record_platform_loan_durations
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
 from shared.monthly_yield_waterfall import compute_monthly_yield_shares
@@ -437,7 +438,7 @@ def fetch_loan_originator_breakdown(session: requests.Session) -> list:
     return originators
 
 
-def fetch_bond_issuer_breakdown(session: requests.Session) -> list:
+def fetch_bond_issuer_breakdown(session: requests.Session, duration_items: list | None = None) -> list:
     """Fetch the per-bond-issuer invested EUR breakdown from the Bonds
     page's own current-investments endpoint (verified live 2026-07-29):
     `GET /webapp/api/bonds-api/v3/investments/current` -> `{"items": [
@@ -463,6 +464,8 @@ def fetch_bond_issuer_breakdown(session: requests.Session) -> list:
         except (TypeError, ValueError):
             continue
         issuers.append({"originator": name, "outstanding": amount})
+        if duration_items is not None:
+            duration_items.append((item, amount))
     return issuers
 
 
@@ -1112,7 +1115,8 @@ def run(session: requests.Session | None = None) -> None:
     try:
         account_summary = fetch_account_summary(session)
         originators = fetch_loan_originator_breakdown(session)
-        bond_issuers = fetch_bond_issuer_breakdown(session)
+        duration_items = []
+        bond_issuers = fetch_bond_issuer_breakdown(session, duration_items)
         portfolio_split = fetch_portfolio_split(session)
         statement_totals = fetch_current_month_statement_totals(session)
     except Exception:
@@ -1475,6 +1479,10 @@ def run(session: requests.Session | None = None) -> None:
         geo_entries = [{"name": name, "amount": round(amount, 2)} for name, amount in combined_originators.items()]
         fill_geographic_repartition_amounts(geo_entries, platform="Mintos")
         fill_geographic_repartition_uninvested_amount("Mintos", account_summary["available"])
+        # Seules les obligations (bonds-api) exposent leur échéance : les prêts individuels ne sont pas récupérés ici.
+        record_platform_loan_durations(
+            PLATFORM_LABEL, "Crowdlending", lambda: durations_from_json_items(duration_items),
+        )
 
 
 if __name__ == "__main__":

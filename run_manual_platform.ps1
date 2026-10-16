@@ -47,7 +47,9 @@ function Invoke-Platforms {
 }
 
 if (-not $StartMonth -and -not $EndMonth) {
+    # Une valeur héritée du terminal ferait traiter d'anciens mois : les durées de prêts ne s'écrivent que pour le mois courant.
     Remove-Item Env:\REPORT_DATE -ErrorAction SilentlyContinue
+    Remove-Item Env:\REPORT_DATE_MONTHS -ErrorAction SilentlyContinue
     Invoke-Platforms
 
     Write-Host "`n=== Summary ===" -ForegroundColor Cyan

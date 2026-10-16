@@ -214,7 +214,9 @@ from shared.google_sheet import (
     fill_geographic_repartition_uninvested_amount,
     fill_lande_loan_geo_amounts,
 )
-from shared.loan_durations import durations_from_table, record_platform_loan_durations
+from shared.loan_durations import (
+    durations_from_labelled_pages, labelled_pairs_from_html, record_platform_loan_durations,
+)
 from shared.report_date import get_report_date, is_current_month
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
 from shared.monthly_yield_waterfall import compute_monthly_yield_shares
@@ -650,6 +652,33 @@ def fetch_active_loan_geo_amounts(session: requests.Session, duration_rows: dict
     return loan_amounts, loan_statuses
 
 
+def fetch_loan_detail_labels(session: requests.Session, loan_id: str) -> dict:
+    """Intitulés/valeurs de la fiche d'un prêt (le tableau des investissements n'a aucune colonne de durée)."""
+    url = f"https://lande.finance/fr/investors/loans/{loan_id}"
+    response = session.get(url, timeout=30)
+    log.info("GET loan page %s: status=%s", loan_id, response.status_code)
+    _check_authenticated(response)
+    response.raise_for_status()
+    return labelled_pairs_from_html(response.text)
+
+
+def collect_loan_duration_pages(session: requests.Session, duration_rows: dict, loan_amounts: dict) -> list:
+    """[({intitulé: valeur} du prêt, encours)] : colonnes du tableau + fiche détail de chaque prêt actif."""
+    headers = duration_rows.get("headers") or []
+    pages = []
+    for loan_id, countries in loan_amounts.items():
+        cells = duration_rows.get("cells", {}).get(loan_id, [])
+        offset = max(0, len(cells) - len(headers))
+        labels = {h: cells[i + offset] for i, h in enumerate(headers) if h and i + offset < len(cells)}
+        try:
+            for label, value in fetch_loan_detail_labels(session, loan_id).items():
+                labels.setdefault(label, value)
+        except Exception:
+            log.exception("Lande loan %s: fiche détail illisible - durées de ce prêt ignorées.", loan_id)
+        pages.append((labels, sum(countries.values())))
+    return pages
+
+
 def _parse_investments_page(page_html: str, loan_amounts: dict, duration_rows: dict | None = None) -> int:
     """Ajoute dans `loan_amounts` les prêts non remboursés de la page ; retourne le nombre de lignes prêt.
     Si `duration_rows` est fourni, y range les intitulés du tableau et les cellules de chaque ligne prêt."""
@@ -786,12 +815,8 @@ def run(session: requests.Session | None = None) -> None:
 
         record_platform_loan_durations(
             PLATFORM_LABEL, "Crowdlending",
-            lambda: durations_from_table(
-                duration_rows.get("headers") or [],
-                [
-                    (duration_rows.get("cells", {}).get(loan_id, []), sum(countries.values()))
-                    for loan_id, countries in active_loan_amounts.items()
-                ],
+            lambda: durations_from_labelled_pages(
+                collect_loan_duration_pages(session, duration_rows, active_loan_amounts)
             ),
         )
 

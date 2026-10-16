@@ -69,7 +69,8 @@ print_summary() {
 }
 
 if [ -z "$START_MONTH" ] && [ -z "$END_MONTH" ]; then
-    unset REPORT_DATE
+    # Une valeur héritée du terminal ferait traiter d'anciens mois : les durées de prêts ne s'écrivent que pour le mois courant.
+    unset REPORT_DATE REPORT_DATE_MONTHS
     invoke_platforms
     print_summary
     exit 0

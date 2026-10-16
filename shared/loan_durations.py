@@ -212,6 +212,39 @@ def strip_html(fragment) -> str:
     return " ".join(html_lib.unescape(text).split())
 
 
+def labelled_pairs_from_html(page_html: str) -> dict[str, str]:
+    """Paires {intitulé: valeur} d'une fiche HTML dont la structure n'est pas connue à l'avance.
+    Lues dans l'ordre : <dt>/<dd>, lignes de tableau <th>/<td>, « Intitulé : valeur », puis lignes de texte
+    consécutives (intitulé court suivi de sa valeur). Le premier intitulé rencontré l'emporte."""
+    page = re.sub(r"<(script|style)\b.*?</\1>", " ", page_html or "", flags=re.DOTALL | re.IGNORECASE)
+    pairs: dict[str, str] = {}
+
+    def add(label, value):
+        label, value = strip_html(label).strip(" :"), strip_html(value)
+        if label and value and len(label) <= 60 and len(value) <= 120 and label not in pairs:
+            pairs[label] = value
+
+    for label, value in re.findall(r"<dt[^>]*>(.*?)</dt>\s*<dd[^>]*>(.*?)</dd>", page, re.DOTALL | re.IGNORECASE):
+        add(label, value)
+    for row in re.findall(r"<tr[^>]*>(.*?)</tr>", page, re.DOTALL | re.IGNORECASE):
+        cells = re.findall(r"<t[hd][^>]*>(.*?)</t[hd]>", row, re.DOTALL | re.IGNORECASE)
+        if len(cells) == 2:
+            add(cells[0], cells[1])
+
+    text = re.sub(r"</?(?:div|p|li|ul|ol|tr|td|th|dt|dd|dl|h[1-6]|section|article|br|span|label|strong|b)\b[^>]*>",
+                  "\n", page, flags=re.IGNORECASE)
+    lines = [strip_html(line) for line in re.sub(r"<[^>]+>", " ", text).split("\n")]
+    lines = [line for line in lines if line]
+    for line in lines:
+        label, sep, value = line.partition(":")
+        if sep and 0 < len(label) <= 60 and value.strip():
+            add(label, value)
+    for label, value in zip(lines, lines[1:]):
+        if len(label) <= 40 and not re.search(r"\d", label) and not label.endswith(":"):
+            add(label, value)
+    return pairs
+
+
 def table_headers_from_html(page_html: str) -> list[str]:
     """Intitulés du premier <thead> d'une page (liste vide s'il n'y en a pas)."""
     match = re.search(r"<thead[^>]*>(.*?)</thead>", page_html or "", re.DOTALL | re.IGNORECASE)
@@ -239,12 +272,14 @@ def parse_amount(value) -> float:
 # --------------------------------------------------------------------------
 
 _TERM_MONTH_KEYS = {"terminmonths", "termmonths", "loanterminmonths", "loantermmonths", "durationinmonths",
-                    "durationmonths", "periodinmonths", "periodmonths", "initialterminmonths", "originaltermmonths"}
+                    "durationmonths", "periodinmonths", "periodmonths", "initialterminmonths", "originaltermmonths",
+                    "investmenthorizoninmonths", "investmenthorizonmonths"}
 _TERM_DAY_KEYS = {"termindays", "termdays", "loantermindays", "loantermdays", "durationindays", "durationdays",
                   "periodindays", "perioddays"}
 _TERM_GENERIC_KEYS = {"term", "loanterm", "duration", "loanduration", "period", "loanperiod", "initialterm",
                       "originalterm", "investmentterm", "projectduration"}
-_REMAINING_MONTH_KEYS = {"remainingterminmonths", "remainingtermmonths", "monthsleft", "remainingmonths"}
+_REMAINING_MONTH_KEYS = {"remainingterminmonths", "remainingtermmonths", "monthsleft", "remainingmonths",
+                         "contractremainingmonths"}
 _REMAINING_DAY_KEYS = {"remainingtermindays", "remainingtermdays", "daysleft", "remainingdays", "daystomaturity",
                        "daysuntilmaturity"}
 _REMAINING_GENERIC_KEYS = {"remainingterm", "remainingduration", "remainingperiod", "termleft"}
