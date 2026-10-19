@@ -213,9 +213,28 @@ def fetch_breakdown(page) -> dict:
     """Navigate to the Open Investments page and read the "Loan Originator
     Breakdown" widget (per-originator percentages) and the "Currently
     Allocated" total invested amount. See module docstring for the
-    verified selectors."""
+    verified selectors.
+
+    With nothing invested (verified live 2026-10-19: "Currently Allocated"
+    0 EUR, no row on the invests API) the "Loan Originator Breakdown" card
+    shows ".statistics-no-data-container" ("No data available") and its
+    ".statistics-pie-bottom-container" stays empty, i.e. 0px high and never
+    "visible" - waiting for that selector timed out. That case returns
+    `{"total_invested": 0.0, "originators": []}`."""
     page.goto(OPEN_INVESTMENTS_URL, wait_until="networkidle")
-    page.wait_for_selector(".statistics-pie-bottom-container", timeout=30000)
+    # Scoped to the originator card (the page has two pie cards): either its
+    # legend rows (some investments) or its "No data available" message.
+    page.wait_for_function(
+        """
+        () => {
+            const card = Array.from(document.querySelectorAll('.statistics-pie-card'))
+                .find((c) => c.querySelector('.title') && c.querySelector('.title').textContent.includes('Loan Originator Breakdown'));
+            return !!card && (card.querySelectorAll('.statistics-legend-container').length > 0
+                || !!card.querySelector('.statistics-no-data-container'));
+        }
+        """,
+        timeout=30000,
+    )
     page.wait_for_timeout(1000)  # let the chart/legend finish rendering
 
     raw = page.evaluate(
@@ -242,21 +261,35 @@ def fetch_breakdown(page) -> dict:
                 totalInvested = amountEl ? amountEl.textContent.trim() : null;
             }
 
-            return { originators, totalInvested };
+            const noData = !!(card && card.querySelector('.statistics-no-data-container'));
+
+            return { originators, totalInvested, noData };
         }
         """
     )
 
     log.info("Raw values read from the Open Investments page: %r", raw)
 
-    if not raw.get("originators"):
-        raise RuntimeError("Could not find the 'Loan Originator Breakdown' widget on the Open Investments page.")
     if not raw.get("totalInvested"):
         raise RuntimeError("Could not find 'Currently Allocated' on the Open Investments page.")
 
     total_invested = _parse_amount(raw["totalInvested"])
     if total_invested is None:
         raise RuntimeError(f"Could not parse the total invested amount out of {raw['totalInvested']!r}.")
+
+    if not raw.get("originators"):
+        if not raw.get("noData"):
+            raise RuntimeError("Could not find the 'Loan Originator Breakdown' widget on the Open Investments page.")
+        # Zeros get written to the Sheet (geographic repartition), so make
+        # sure "No data available" isn't a widget that simply hasn't loaded
+        # yet: the invests API, the page's own source, must agree.
+        if total_invested > 0 or fetch_open_investments(page):
+            raise RuntimeError(
+                "The 'Loan Originator Breakdown' widget says 'No data available' but the account has open "
+                f"investments (Currently Allocated {raw['totalInvested']!r}) - page probably not fully loaded."
+            )
+        log.info("No open investment on the account (Currently Allocated 0, no data in the originator widget).")
+        return {"total_invested": 0.0, "originators": []}
 
     originators = []
     for o in raw["originators"]:
