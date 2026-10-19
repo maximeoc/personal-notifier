@@ -111,6 +111,7 @@ from shared.google_sheet import (
     fill_geographic_repartition_amounts,
     fill_geographic_repartition_uninvested_amount,
 )
+from shared.loan_durations import durations_from_json_items, record_platform_loan_durations
 from shared.report_date import get_report_now, is_current_month
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
@@ -132,6 +133,15 @@ OPEN_INVESTMENTS_URL = "https://swaper.com/en/investments/open-investments"
 STATEMENT_PAGE_URL = "https://swaper.com/en/investments/account-statement"
 ACCOUNT_ENTRIES_API_URL = "https://swaper.com/rest/public/profile/account-entries"
 REFERRAL_BONUS_PAGE_URL = "https://swaper.com/en/bonuses/refer-friends"
+OPEN_INVESTMENTS_API_URL = "https://swaper.com/rest/public/profile/invests"
+OPEN_INVESTMENTS_PAGE_SIZE = 100
+OPEN_INVESTMENTS_MAX_PAGES = 50
+# (loanStatus, loanStatusDetail) filters of the invests API whose union is
+# every open investment: a DELAYED (late) loan is NOT returned by
+# loanStatus="OPEN" (verified live 2026-10-16), only by loanStatusDetail
+# "DELAYED". "EXTENDED" is the API's third progress status (the enum is
+# [EXTENDED, DELAYED, CURRENT]); it had no rows on 2026-10-16.
+OPEN_INVESTMENTS_FILTERS = (("OPEN", None), (None, "DELAYED"), (None, "EXTENDED"))
 STORAGE_STATE_FILE = Path(__file__).parent / "swaper_diversification_storage_state.json"
 # Cache of every deposit/withdrawal cashflow ever fetched for the XIRR
 # calculation (see get_cached_account_cashflows() below) - avoids
@@ -256,6 +266,59 @@ def fetch_breakdown(page) -> dict:
         originators.append({"originator": o["name"], "percentage": percentage})
 
     return {"total_invested": total_invested, "originators": originators}
+
+
+def fetch_open_investments(page) -> list:
+    """Every open investment from `POST /rest/public/profile/invests` (the
+    Open Investments page's own list; verified live 2026-10-16), paginated,
+    merged over OPEN_INVESTMENTS_FILTERS (deduplicated by row "id").
+    Each row has "group" (the loan originator), "dueDate" (exact maturity,
+    "YYYY-MM-DD"), "ownAmount" (the investor's outstanding amount),
+    "nextPaymentDate" and "progressStatusDetail" (CURRENT / DELAYED /
+    EXTENDED). Rows whose "status" isn't "OPEN" are dropped."""
+    investments = []
+    seen_ids = set()
+    for loan_status, status_detail in OPEN_INVESTMENTS_FILTERS:
+        page_number = 1
+        fetched = 0
+        while page_number <= OPEN_INVESTMENTS_MAX_PAGES:
+            result = page.evaluate(
+                """
+                async ([url, pageNumber, pageSize, loanStatus, loanStatusDetail]) => {
+                    const raw = localStorage.getItem('X-XSRF-TOKEN');
+                    const token = raw ? JSON.parse(raw) : null;
+                    const res = await fetch(url, {
+                        method: 'POST',
+                        credentials: 'include',
+                        headers: { 'content-type': 'application/json;charset=UTF-8', 'x-xsrf-token': token },
+                        body: JSON.stringify({
+                            page: pageNumber, pageSize: pageSize, loanStatusDetail: loanStatusDetail, loanStatus: loanStatus,
+                            amountFrom: null, amountTo: null, groups: [], productTypes: [],
+                        }),
+                    });
+                    return { ok: res.ok, status: res.status, body: await res.json().catch(() => null) };
+                }
+                """,
+                [OPEN_INVESTMENTS_API_URL, page_number, OPEN_INVESTMENTS_PAGE_SIZE, loan_status, status_detail],
+            )
+            if not result.get("ok"):
+                raise RuntimeError(f"Open investments API returned status {result.get('status')} (page {page_number})")
+
+            body = result.get("body") or {}
+            results = body.get("results") or []
+            fetched += len(results)
+            for row in results:
+                if row.get("status") == "OPEN" and row.get("id") not in seen_ids:
+                    seen_ids.add(row.get("id"))
+                    investments.append(row)
+            total_records = body.get("totalRecords")
+            if not results or total_records is None or fetched >= total_records:
+                break
+            page_number += 1
+        else:
+            log.warning("Hit OPEN_INVESTMENTS_MAX_PAGES (%d) - open investments may be incomplete.", OPEN_INVESTMENTS_MAX_PAGES)
+
+    return investments
 
 
 def compute_amounts(breakdown: dict) -> list:
@@ -1154,6 +1217,16 @@ def run(headless: bool = True) -> None:
                 log.exception("Failed to compute the XIRR block as of %s.", get_report_now(REPORT_TIMEZONE).date())
                 xirr_backfill_block = {}
 
+        # Live-only snapshot (like the geographic repartition): needs the
+        # Playwright session, written to the 'durées prêts' sheet at the end
+        # of run().
+        open_investments = None
+        if current_month:
+            try:
+                open_investments = fetch_open_investments(page)
+            except Exception:
+                log.exception("Failed to fetch the open investments - the 'durées prêts' sheet will not be updated.")
+
         # Persist cookies/local storage so the next run can skip login (and
         # 2FA) while the session remains valid.
         context.storage_state(path=str(STORAGE_STATE_FILE))
@@ -1515,6 +1588,18 @@ def run(headless: bool = True) -> None:
         fill_geographic_repartition_amounts(loan_originators, platform="Swaper")
         if uninvested_balance is not None:
             fill_geographic_repartition_uninvested_amount("Swaper", uninvested_balance)
+
+        if open_investments is not None:
+            # "dueDate" is Swaper's maturity: exposed as "maturityDate", the
+            # key shared.loan_durations recognises. Rows with nothing
+            # outstanding (ownAmount 0, e.g. late loans already bought back)
+            # are skipped by durations_from_json_items().
+            record_platform_loan_durations(
+                "Swaper", "Crowdlending",
+                lambda: durations_from_json_items(
+                    ({**inv, "maturityDate": inv.get("dueDate")}, float(inv.get("ownAmount") or 0.0)) for inv in open_investments
+                ),
+            )
 
 
 if __name__ == "__main__":
