@@ -74,11 +74,11 @@ on:
       #   type: boolean
       #   required: false
       #   default: true
-      # run_income_marketplace:
-      #   description: "Income Marketplace"
-      #   type: boolean
-      #   required: false
-      #   default: true
+      run_income_marketplace:
+        description: "Income Marketplace"
+        type: boolean
+        required: false
+        default: true
 
 permissions:
   contents: read
