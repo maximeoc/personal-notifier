@@ -1,4 +1,4 @@
-"""Afranga portfolio diversification (by loan originator) fetcher.
+﻿"""Afranga portfolio diversification (by loan originator) fetcher.
 
 Logs into afranga.com via pure HTTP (email/password + a single-field Google
 Authenticator TOTP code, form-urlencoded POSTs against a Laravel CSRF `_token`
@@ -27,35 +27,13 @@ Auth flow verified 2026-07-18 via a real browser network capture:
      for every subsequent authenticated GET - no bearer token, no extra
      headers needed.
 
-Unlike PeerBerry/Lendermarket, Afranga has no JSON API for this - "My
-investments" is an old-school server-rendered (Laravel + jQuery) page: the
-table is populated by
-`GET https://afranga.com/profile/my-investments/refresh?<filters>&limit=N`
-which returns an HTML fragment (a `<table id="myInvestmentsTable">`), not
-JSON. Verified against the real account on 2026-07-09 (and re-verified via
-pure HTTP on 2026-07-18):
-- Requires a `_token` CSRF query param, read from `input[name='_token']` on
-  the my-investments page itself (a hidden field of the filter form).
-- `limit` must be one of the dropdown's allowed values (25/50/100/250) -
-  250 is used here to fetch everything in one call; larger values return
-  HTTP 400. No offset/page param was found, so accounts with more than 250
-  active investments would be truncated (logged as a warning if the exact
-  cap is hit - fine for now, revisit if/when the portfolio grows that big).
-- Each `<tr>` has the loan originator as an `<img alt="X logo">` (never as
-  plain text) in the 6th `<td>`, and the outstanding amount as
-  "€ 1 234.56"-formatted text in the 12th `<td>` ("Outstanding Investment"
-  column - the remaining/still-invested capital, as opposed to "Invested
-  Amount" which is the original amount before any repayments). The last row
-  is always a "Total:" summary row, not a real investment (its first `<td>`
-  has no Loan ID link), and is skipped. NOTE: a leading `<td>` (a "Sell on
-  Secondary market" checkbox, added by Afranga at some point after this was
-  first verified) shifts every column index by +1 versus earlier versions
-  of this comment - re-verify live (e.g. via a throwaway probe script) if
-  investments start silently disappearing again (0 parsed rows despite a
-  non-zero "Invested Funds" on the overview page is the telltale symptom).
-- Parsed via regex only (no HTML parser dependency), same approach as
-  bienpreter_diversification.py: split the fragment into `<tr>...</tr>`
-  blocks, then each block into `<td>...</td>` cells.
+Investments come from the redesigned "My investments" page's JSON API
+(verified live 2026-10-12; the old HTML `/refresh` fragment now 404s):
+`GET https://afranga.com/profile/my-investments/api/rows?limit=<10|25|50>&page=N`
+returns `{cards: [...], last_page}` - each card has `originator.name` and
+`invested.value` (the outstanding/still-invested capital, cross-checked
+against the overview's "Invested Funds"). Any other `limit` value returns
+HTTP 400, so pages are walked until `last_page`. No CSRF token needed.
 
 Also fetches this calendar month's "Gross interest received" and
 "Withholding Tax" from the Account Statement page
@@ -173,10 +151,17 @@ from shared.google_sheet import (
     fill_current_month_bonus_breakdown,
     fill_geographic_repartition_amounts,
     fill_geographic_repartition_uninvested_amount,
+    fill_remaining_duration_amounts,
 )
-from shared.loan_durations import (
-    durations_from_table, record_platform_loan_durations, strip_html, table_headers_from_html,
+from shared.rate_sheet import fill_rate_amounts
+from shared.remaining_duration import (
+    RateWeights,
+    base_term_between,
+    base_term_from_days,
+    overdue_months_and_days,
+    remaining_months_and_days,
 )
+from shared.loan_durations import DurationExtraction, LoanDuration, months_between, record_platform_loan_durations
 from shared.report_date import get_report_now, is_current_month
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
@@ -192,7 +177,8 @@ LOGIN_URL = "https://afranga.com/login"
 TWO_FA_URL = "https://afranga.com/2fa/verify"
 PROFILE_OVERVIEW_URL = "https://afranga.com/profile/overview"
 MY_INVESTMENTS_URL = "https://afranga.com/profile/my-investments"
-REFRESH_URL = "https://afranga.com/profile/my-investments/refresh"
+ROWS_API_URL = "https://afranga.com/profile/my-investments/api/rows"
+ROWS_API_LIMIT = 50  # largest accepted value (10/25/50); others return 400
 STATEMENT_PAGE_URL = "https://afranga.com/profile/account-statement"
 STATEMENT_REFRESH_URL = "https://afranga.com/profile/account-statement/refresh"
 BONUS_CASHBACK_HISTORY_URL = "https://afranga.com/profile/bonus-cashback/history"
@@ -323,74 +309,125 @@ def login(session: requests.Session) -> None:
     log.info("Logged in successfully, current URL: %s", r.url)
 
 
-def fetch_investments(session: requests.Session) -> list:
-    """Fetch every active investment by calling the same HTML-fragment
-    endpoint the "My investments" page itself uses (see module docstring
-    for the verified shape/quirks). Parses the response via regex and
-    returns a list of {"originator", "outstanding"} dicts (amounts as
-    floats), skipping the trailing "Total:" summary row.
-    """
-    r = session.get(MY_INVESTMENTS_URL, headers=_HEADERS, timeout=20)
-    r.raise_for_status()
-    token = _extract_csrf_token(r.text)
-    page_headers = table_headers_from_html(r.text)
+_MATURITY_RE = re.compile(r"Maturity\s+(\d{2})\.(\d{2})\.(\d{4})")
+_LISTING_DATE_RE = re.compile(r"Listing date\s+(\d{2})\.(\d{2})\.(\d{4})")
+_LOAN_TERM_RE = re.compile(r"Loan Term\s+(\d+)\s*([md])\b", re.IGNORECASE)  # "Loan Term 36m."
+# One payment-schedule row of the panel: "Due Date dd.mm.yyyy ... Status <X>"
+# (X is "Paid" or "Scheduled" in everything seen live; the Status word is
+# followed by "Payment Date" or the next "Due Date").
+_SCHEDULE_ROW_RE = re.compile(
+    r"Due Date\s+(\d{2})\.(\d{2})\.(\d{4})\b.*?\bStatus\s+([A-Za-z][A-Za-z ]*?)\s+(?:Payment Date|Due Date|The proceeds|KIIS|$)"
+)
+_CARD_RATE_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*%")  # "16% · 32m left" (annual interest rate, in percent)
+_MONTHS = {m: i for i, m in enumerate(("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"), start=1)}
+_CARD_DATE_RE = re.compile(r"(\d{1,2})\s+([A-Za-z]{3})[a-z]*\.?\s+(\d{4})")
 
-    log.info("Requesting My investments refresh endpoint (limit=%d)...", MAX_LIMIT)
+
+def _parse_card_date(text: str | None) -> date | None:
+    """Parse the card's "15 Nov 2026" next-payment date (English locale)."""
+    match = _CARD_DATE_RE.search(text or "")
+    if not match or match.group(2).title() not in _MONTHS:
+        return None
+    return date(int(match.group(3)), _MONTHS[match.group(2).title()], int(match.group(1)))
+
+
+def fetch_loan_dates(session: requests.Session, panel_url: str, today: date) -> tuple:
+    """(maturity, earliest_unpaid_due, base_term) of a loan, read from its
+    investment panel (dates are date | None; base_term is the loan's original
+    (months, days) term, see _panel_base_term). Maturity is the "Maturity dd.mm.yyyy" field
+    (verified live 2026-10-16) - the card's own "32m left" label only has
+    month precision. earliest_unpaid_due is the oldest payment-schedule row
+    already due before `today` whose Status isn't "Paid" (None when there is
+    none; only "Paid"/"Scheduled" rows were seen live, so the late status
+    wording itself is not verified)."""
     r = session.get(
-        REFRESH_URL,
-        params={
-            "_token": token,
-            "interest_rate_percent[from]": "", "interest_rate_percent[to]": "",
-            "period[from]": "", "period[to]": "",
-            "created_at[from]": "", "created_at[to]": "",
-            "invested_amount[from]": "", "invested_amount[to]": "",
-            "loan[type]": "", "loan[early_repayment_possible]": "",
-            "limit": str(MAX_LIMIT),
-        },
+        panel_url,
         headers={**_HEADERS, "X-Requested-With": "XMLHttpRequest"},
         timeout=20,
     )
-    log.info("My investments refresh endpoint response: status=%s", r.status_code)
-    if not r.ok:
-        raise RuntimeError(f"My investments refresh endpoint returned status {r.status_code}")
+    r.raise_for_status()
+    text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", r.text))
+    maturity = None
+    match = _MATURITY_RE.search(text)
+    if match:
+        day, month, year = (int(g) for g in match.groups())
+        maturity = date(year, month, day)
+    unpaid_dues = [
+        date(int(y), int(mo), int(d))
+        for d, mo, y, status in _SCHEDULE_ROW_RE.findall(text)
+        if status.strip().lower() != "paid" and date(int(y), int(mo), int(d)) < today
+    ]
+    return maturity, min(unpaid_dues, default=None), _panel_base_term(text, maturity)
 
-    tbody_m = re.search(r"<tbody[^>]*>(.*?)</tbody>", r.text, re.DOTALL)
-    tbody_html = tbody_m.group(1) if tbody_m else ""
-    raw_rows = re.findall(r"<tr[^>]*>(.*?)</tr>", tbody_html, re.DOTALL)
-    log.info("Parsed %d raw row(s) from the My investments table (before filtering the Total row).", len(raw_rows))
-    # Intitulés des colonnes (durée des prêts) : ceux du fragment s'il en a, sinon ceux de la page complète.
-    table_headers = table_headers_from_html(r.text) or page_headers
 
+def _panel_base_term(text: str, maturity: date | None) -> tuple | None:
+    """Original term of a loan from its panel text: the "Loan Term 36m." field
+    (months, or days if suffixed "d"), else "Listing date" -> "Maturity"."""
+    match = _LOAN_TERM_RE.search(text)
+    if match:
+        value = int(match.group(1))
+        return (value, 0) if match.group(2).lower() == "m" else base_term_from_days(value)
+    match = _LISTING_DATE_RE.search(text)
+    if match and maturity is not None:
+        day, month, year = (int(g) for g in match.groups())
+        return base_term_between(date(year, month, day), maturity)
+    return None
+
+
+def fetch_investments(session: requests.Session) -> list:
+    """Fetch every active investment from the "My investments" JSON API
+    (redesign verified live 2026-10-12: the old HTML `/refresh` fragment
+    now 404s). Returns a list of {"originator", "outstanding", "loan_id",
+    "panel_url", "status", "overdue", "next_payment_date", "rate"} dicts
+    ("rate" = annual interest rate in percent from the card's "16% · 32m
+    left" label, None if absent).
+
+    Late/default signals (verified live 2026-10-16 on a portfolio with only
+    current loans, so the late/default values themselves are inferred from
+    the page's own template/filters): `status.label` ("Current" for all
+    three loans; the page filters on Current / 1-15 / 16-30 / 31-60 / 60+
+    days late), `next_payment.overdue` (bool; the page then displays
+    "Overdue since <next_payment.date>"), and `next_payment.date` ("15 Nov
+    2026"). No default status is exposed by the list - a "default" word in
+    `status.label` is the (unverified) assumption used for it.
+    """
     investments = []
-    for row_html in raw_rows:
-        cells = re.findall(r"<td[^>]*>(.*?)</td>", row_html, re.DOTALL)
-        if len(cells) < 12:
-            continue
-        # Indices are +1 vs. an older verification of this page - Afranga
-        # added a leading checkbox `<td>` ("Sell on Secondary market") since.
-        loan_id_m = re.search(r">\s*(\d+)\s*<", cells[2])
-        originator_m = re.search(r'alt="([^"]+)"', cells[5])
-        if not loan_id_m or not originator_m:
-            continue  # the trailing "Total:" row has no loan ID / originator
-        outstanding_m = re.search(r"€\s*([\d\s.,]+)", cells[11])
-        investments.append(
-            {
-                "originator": originator_m.group(1),
-                "outstanding": _parse_amount(outstanding_m.group(1) if outstanding_m else None),
-                "cells": [strip_html(cell) for cell in cells],
-                "table_headers": table_headers,
-            }
+    page = 1
+    while True:
+        log.info("Requesting My investments rows API (page %d)...", page)
+        r = session.get(
+            ROWS_API_URL,
+            params={"limit": str(ROWS_API_LIMIT), "page": str(page)},
+            headers={**_HEADERS, "Accept": "application/json", "X-Requested-With": "XMLHttpRequest"},
+            timeout=20,
         )
+        log.info("My investments rows API response: status=%s", r.status_code)
+        if not r.ok:
+            raise RuntimeError(f"My investments rows API returned status {r.status_code}")
 
-    log.info("%d row(s) remain after filtering out the trailing Total row.", len(investments))
+        payload = r.json()
+        for card in payload.get("cards") or []:
+            invested = card.get("invested") or {}
+            next_payment = card.get("next_payment") or {}
+            rate_match = _CARD_RATE_RE.search(invested.get("meta") or "")
+            investments.append(
+                {
+                    "originator": (card.get("originator") or {}).get("name") or "Unknown",
+                    "outstanding": float(invested.get("value") or 0.0),
+                    "loan_id": card.get("loan_id"),
+                    "panel_url": card.get("panel_url"),
+                    "status": (card.get("status") or {}).get("label") or "",
+                    "overdue": bool(next_payment.get("overdue")),
+                    "next_payment_date": _parse_card_date(next_payment.get("date")),
+                    "rate": float(rate_match.group(1).replace(",", ".")) if rate_match else None,
+                }
+            )
 
-    if len(investments) >= MAX_LIMIT:
-        log.warning(
-            "Fetched exactly the max page size (%d) - the portfolio may have more investments than "
-            "this endpoint can return in one call (no pagination param is known to work here).",
-            MAX_LIMIT,
-        )
+        if page >= int(payload.get("last_page") or 1):
+            break
+        page += 1
 
+    log.info("Fetched %d active investment(s) from the My investments rows API.", len(investments))
     return investments
 
 
@@ -418,13 +455,85 @@ def fetch_uninvested_balance(session: requests.Session) -> float:
     return _parse_amount(match.group(1))
 
 
+def _clean_originator_name(name: str) -> str:
+    return re.sub(r"\s*logo$", "", name or "Unknown", flags=re.IGNORECASE).strip()
+
+
+def aggregate_remaining_durations(session: requests.Session, investments: list, today: date, rates=None) -> dict:
+    """Group investments by loan originator, then by remaining term as of
+    `today` (months, days): {originator: {term: outstanding}}. The panel
+    dates are fetched once per loan; investments whose maturity can't be
+    determined are skipped (with a warning).
+
+    A late investment (card `next_payment.overdue`) is grouped by how long
+    ago its payment was missed instead: the card's "Overdue since" date,
+    else the earliest unpaid past-due row of the loan's payment schedule;
+    one whose `status.label` mentions "default"/"recovery" (assumed, never
+    seen live) is grouped as defaulted. Without any usable past date it
+    keeps its remaining term."""
+    panel_dates = {}
+    result = {}
+    for inv in investments:
+        originator = _clean_originator_name(inv.get("originator"))
+        loan_key = inv.get("loan_id") or inv.get("panel_url")
+
+        def loan_dates():
+            if loan_key not in panel_dates:
+                try:
+                    panel_dates[loan_key] = fetch_loan_dates(session, inv["panel_url"], today)
+                except Exception:
+                    log.exception("Failed to fetch the panel dates of loan %s.", loan_key)
+                    panel_dates[loan_key] = (None, None, None)
+            # Conservées pour l'onglet « durées prêts » (durations_from_panel_dates).
+            inv["maturity_date"], _, inv["base_term"] = panel_dates[loan_key]
+            return panel_dates[loan_key]
+
+        status = (inv.get("status") or "").lower()
+        is_default = "default" in status or "recovery" in status
+        term = None
+        if inv.get("overdue") or is_default:
+            due = inv.get("next_payment_date") if inv.get("overdue") else None
+            if due is None or due >= today:
+                due = loan_dates()[1]
+            if due is not None:
+                term = overdue_months_and_days(today, due, default=is_default)
+        if term is None:
+            maturity = loan_dates()[0]
+            if maturity is None:
+                log.warning("No maturity date found for an investment of %s (%.2f EUR) - skipped.", originator, inv.get("outstanding", 0.0))
+                continue
+            term = remaining_months_and_days(today, maturity)
+        durations = result.setdefault(originator, {})
+        durations[term] = durations.get(term, 0.0) + inv.get("outstanding", 0.0)
+        if rates is not None:
+            base_term = loan_dates()[2]
+            if base_term is None:
+                log.warning("No base term found for an investment of %s (%.2f EUR) - excluded from the 'taux' sheet.", originator, inv.get("outstanding", 0.0))
+            rates.add(originator, term, inv.get("outstanding", 0.0), inv.get("rate"), base_term=base_term)
+    return result
+
+
+def durations_from_panel_dates(investments: list, today: date) -> DurationExtraction:
+    """Durée initiale (« Loan Term ») et restante (« Maturity ») de chaque prêt pour l'onglet « durées prêts »,
+    à partir des dates de panneau déjà lues par aggregate_remaining_durations()."""
+    loans = []
+    for inv in investments:
+        maturity, base_term = inv.get("maturity_date"), inv.get("base_term")
+        loans.append(LoanDuration(
+            amount=inv.get("outstanding", 0.0),
+            term_months=base_term[0] + base_term[1] / 30.4375 if base_term else None,
+            remaining_months=max(months_between(today, maturity), 0.0) if maturity else None,
+        ))
+    return DurationExtraction(loans, source="panneau Afranga (Loan Term / Maturity)")
+
+
 def aggregate_by_originator(investments: list) -> list:
     """Group investments by loan originator and sum the outstanding
     (remaining) investment amount for each - one entry per originator,
     sorted by amount descending."""
     totals = {}
     for inv in investments:
-        originator = re.sub(r"\s*logo$", "", inv.get("originator") or "Unknown", flags=re.IGNORECASE).strip()
+        originator = _clean_originator_name(inv.get("originator"))
         totals[originator] = totals.get(originator, 0.0) + inv.get("outstanding", 0.0)
 
     originators = [{"originator": name, "outstanding": amount} for name, amount in totals.items()]
@@ -1289,10 +1398,14 @@ def compute_xirr_block_as_of(session: requests.Session, all_detail_rows: list, x
         all_detail_rows, lifetime_statement_totals_as_of["opening_balance"], lifetime_statement_totals_as_of["closing_balance"],
         since_inception_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"),
     )
-    cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + outstanding_as_of)
-    lifetime_yield_rate = lifetime_statement_totals_as_of["gross_interest_received"] / outstanding_as_of
+    # Time-weighted like the idle cash: end-of-period balance understates the yield on a fast-growing account.
+    avg_invested_lifetime = compute_average_balances(all_detail_rows, since_inception_date, end_date)[0]
+    if avg_invested_lifetime is None or avg_invested_lifetime <= 0:
+        avg_invested_lifetime = outstanding_as_of
+    cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + avg_invested_lifetime)
+    lifetime_yield_rate = lifetime_statement_totals_as_of["gross_interest_received"] / avg_invested_lifetime
     cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
-    missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + outstanding_as_of)
+    missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + avg_invested_lifetime)
 
     lifetime_withholding_tax = lifetime_statement_totals_as_of["withholding_tax"]
     lifetime_gross_interest = lifetime_statement_totals_as_of["gross_interest_received"]
@@ -1367,12 +1480,6 @@ def run() -> None:
         }
 
     try:
-        bonus_cashback = fetch_current_month_bonus_cashback(session)
-    except Exception:
-        log.exception("Failed to fetch this month's Bonus Cashback total - defaulting to 0.0.")
-        bonus_cashback = 0.0
-
-    try:
         uninvested_balance = fetch_uninvested_balance(session)
     except Exception:
         log.exception("Failed to fetch the uninvested wallet balance - 'non investi' will not be updated.")
@@ -1393,7 +1500,8 @@ def run() -> None:
     statement_totals["net_interest_received"] = (
         statement_totals["gross_interest_received"] - statement_totals["withholding_tax"]
     )
-    statement_totals["bonus_cashback_contest"] = bonus_cashback
+    # Ledger total (Bonus received/Cashback bonus/Registration Bonus) is a superset of the Bonus Cashback campaign page's payouts.
+    statement_totals["bonus_cashback_contest"] = statement_totals["bonus_total"]
     log.info(
         "This month's statement totals: total=%.2f EUR, gross_interest_received=%.2f EUR, "
         "net_interest_received=%.2f EUR, withholding_tax=%.2f EUR",
@@ -1615,18 +1723,20 @@ def run() -> None:
             if deposit_dates:
                 since_inception_date = datetime.strptime(min(deposit_dates), "%Y-%m-%d").date()
                 years_elapsed = max((today_date - since_inception_date).days / 365.25, 1 / 365.25)
-                # Lifetime shares still use total_invested (today's live
-                # snapshot), not avg_invested_balance - no lifetime-average
-                # equivalent is computed anywhere, and these shares operate
-                # over the since-inception period, not this month's.
+                # Lifetime shares use their own since-inception averages
+                # (avg_invested_lifetime below), not this month's avg_invested_balance.
                 avg_idle_cash_lifetime = compute_average_idle_cash(
                     all_detail_rows or [], lifetime_statement_totals["opening_balance"], lifetime_statement_totals["closing_balance"],
                     since_inception_date.strftime("%Y-%m-%d"), today_date_str,
                 )
-                cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + total_invested)
-                lifetime_yield_rate = lifetime_statement_totals["gross_interest_received"] / total_invested
+                # Time-weighted like the idle cash: end-of-period balance understates the yield on a fast-growing account.
+                avg_invested_lifetime = compute_average_balances(all_detail_rows or [], since_inception_date, today_date)[0]
+                if avg_invested_lifetime is None or avg_invested_lifetime <= 0:
+                    avg_invested_lifetime = total_invested
+                cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + avg_invested_lifetime)
+                lifetime_yield_rate = lifetime_statement_totals["gross_interest_received"] / avg_invested_lifetime
                 cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
-                missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_invested)
+                missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + avg_invested_lifetime)
 
                 lifetime_bonus_total = lifetime_statement_totals["bonus_total"]
                 lifetime_withholding_tax = lifetime_statement_totals["withholding_tax"]
@@ -1738,12 +1848,23 @@ def run() -> None:
         if uninvested_balance is not None:
             fill_geographic_repartition_uninvested_amount("Afranga", uninvested_balance)
 
+        # Own try/except: the "durée" tab is a secondary view, its failure
+        # must not fail the whole run.
+        rates = RateWeights()
+        try:
+            fill_remaining_duration_amounts(
+                "Afranga", aggregate_remaining_durations(session, investments, today_date, rates=rates), rates=rates
+            )
+        except Exception:
+            log.exception("Failed to update the 'durée' sheet for Afranga.")
+        else:
+            try:
+                fill_rate_amounts("Afranga", rates)
+            except Exception:
+                log.exception("Failed to update the 'taux' sheet for Afranga.")
+        # Onglet « durées prêts » : réutilise les dates des panneaux lues ci-dessus.
         record_platform_loan_durations(
-            "Afranga", "Crowdlending",
-            lambda: durations_from_table(
-                investments[0]["table_headers"] if investments else [],
-                [(inv["cells"], inv["outstanding"]) for inv in investments],
-            ),
+            "Afranga", "Crowdlending", lambda: durations_from_panel_dates(investments, today_date),
         )
 
 

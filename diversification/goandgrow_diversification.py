@@ -102,6 +102,7 @@ logging in again if the persisted session stops working.
 """
 
 import os
+import re
 import sys
 import logging
 from datetime import date, datetime, timedelta
@@ -114,8 +115,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts
+from shared.google_sheet import fill_current_month_amounts, fill_current_month_bonus_breakdown, fill_geographic_repartition_amounts, fill_remaining_duration_amounts
 from shared.loan_durations import record_constant_duration
+from shared.remaining_duration import RateWeights
+from shared.rate_sheet import fill_rate_amounts
 from shared.report_date import get_report_now, is_current_month
 from shared.session_cache import get_or_refresh_session
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
@@ -167,11 +170,25 @@ class _LoginFormParser(HTMLParser):
                 self.inputs[name] = attrs.get("value", "")
 
 
-def _find_form(html: str):
+def _describe_page(resp: requests.Response) -> str:
+    """Short, secret-free description of a response (status, final URL,
+    <title>, first visible text) for diagnosing unexpected login pages."""
+    text = re.sub(r"(?is)<(script|style).*?</\1>", " ", resp.text)
+    title = re.search(r"(?is)<title[^>]*>(.*?)</title>", text)
+    title_text = re.sub(r"\s+", " ", title.group(1)).strip() if title else None
+    visible = re.sub(r"\s+", " ", re.sub(r"(?s)<[^>]+>", " ", text)).strip()
+    return (
+        f"status={resp.status_code}, url={resp.url.split('?')[0]}, length={len(resp.text)}, "
+        f"title={title_text!r}, text={visible[:300]!r}"
+    )
+
+
+def _find_form(html: str, resp: requests.Response | None = None):
     parser = _LoginFormParser()
     parser.feed(html)
     if not parser.action:
-        raise RuntimeError("No <form> found in the page - the login flow may have changed.")
+        details = f" Page: {_describe_page(resp)}" if resp is not None else ""
+        raise RuntimeError(f"No <form> found in the page - the login flow may have changed.{details}")
     return parser.action, parser.inputs
 
 
@@ -181,16 +198,20 @@ def login(session: requests.Session) -> None:
     3-step exchange. No browser/Playwright involved at all."""
     log.info("Starting Go & Grow login (pure HTTP, no browser - see module docstring)...")
 
+    # A persisted-but-rejected session leaves stale Keycloak/app cookies in
+    # the jar, which derail the fresh login flow below - always start clean.
+    session.cookies.clear()
+
     resp = session.get(LOGIN_URL, timeout=30)
     resp.raise_for_status()
-    action, inputs = _find_form(resp.text)
+    action, inputs = _find_form(resp.text, resp)
     inputs["username"] = GOANDGROW_EMAIL
     inputs["password"] = GOANDGROW_PASSWORD
     log.info("Submitting credentials to the Keycloak login form...")
     resp2 = session.post(action, data=inputs, timeout=30)
     resp2.raise_for_status()
 
-    action2, inputs2 = _find_form(resp2.text)
+    action2, inputs2 = _find_form(resp2.text, resp2)
     log.info("Submitting the OIDC callback form...")
     resp3 = session.post(action2, data=inputs2, timeout=30)
     resp3.raise_for_status()
@@ -697,6 +718,27 @@ def run() -> None:
             PLATFORM_LABEL, "Crowdlending savings", 0, balance,
             "épargne retirable à tout moment, pas de prêts individuels",
         )
+
+        # Go & Grow has no vaults/terms - the whole balance is withdrawable
+        # at any time, i.e. a remaining term of 0 days. Own try/except: the
+        # "durée" tab is a secondary view, its failure must not fail the run.
+        rates = RateWeights()
+        try:
+            durations = {PLATFORM_LABEL: {(0, 0): round(balance, 2)}} if round(balance, 2) > 0 else {}
+            # `AnnualTargetReturnRate` is a fraction (0.06 = 6 %). The goal exposes no loan term (`TargetDate` is
+            # the saver's own target, null here): base_term stays None, so Go & Grow is left out of the "taux" tab.
+            for goal in goals:
+                if goal.get("AnnualTargetReturnRate") is not None:
+                    log.warning("No base term exposed by Go & Grow for its goal - excluded from the 'taux' sheet.")
+                    rates.add(PLATFORM_LABEL, (0, 0), goal.get("ClientValue"), float(goal["AnnualTargetReturnRate"]) * 100, base_term=None)
+            fill_remaining_duration_amounts(PLATFORM_LABEL, durations, platform_level=True, rates=rates)
+        except Exception:
+            log.exception("Failed to update the 'durée' sheet for Go & Grow.")
+
+        try:
+            fill_rate_amounts(PLATFORM_LABEL, rates, platform_level=True)
+        except Exception:
+            log.exception("Failed to update the 'taux' sheet for Go & Grow.")
 
 
 if __name__ == "__main__":

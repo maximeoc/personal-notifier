@@ -8,7 +8,7 @@ suivante) :
 
 - Nom : nom de la plateforme (ligne de bloc) ou du loan.
 - Pays : pays du loan (peut être vide).
-- Actif : "x" = le robot peut investir sur ce loan.
+- Actif marché primaire : "x" = le robot peut investir sur ce loan.
 - Taux min / Taux max : bornes du taux d'intérêt des prêts acceptés
   (vide = pas de borne).
 - Pourcentage max du solde par pays : sur la ligne de la plateforme,
@@ -72,6 +72,26 @@ _OPTIONAL_COLUMN_PREFIXES = {
 def _norm(text) -> str:
     ascii_text = unicodedata.normalize("NFKD", str(text or "")).encode("ascii", "ignore").decode()
     return re.sub(r"\s+", " ", ascii_text).strip().casefold()
+
+
+def match_name(raw_name, names, partial: bool = True) -> str | None:
+    """Retourne l'élément de `names` correspondant à `raw_name` : égalité
+    exacte puis (si `partial`) sous-chaîne, insensible à la casse/aux accents.
+    Sert à relier un nom saisi dans la sheet "config robots" au nom réel
+    d'une société/originator sur la plateforme."""
+    value = _norm(raw_name)
+    if not value:
+        return None
+    names = list(names)
+    for name in names:
+        if _norm(name) == value:
+            return name
+    if partial:
+        for name in names:
+            normalized = _norm(name)
+            if normalized and (normalized in value or value in normalized):
+                return name
+    return None
 
 
 def _parse_number(raw):
@@ -148,17 +168,8 @@ class PlatformConfig:
     def find_loan(self, raw_name) -> LoanConfig | None:
         """Retrouve le loan dont le nom correspond à `raw_name` (exact puis
         sous-chaîne, insensible à la casse/aux accents)."""
-        value = _norm(raw_name)
-        if not value:
-            return None
-        for name, loan in self.loans.items():
-            if _norm(name) == value:
-                return loan
-        for name, loan in self.loans.items():
-            normalized = _norm(name)
-            if normalized in value or value in normalized:
-                return loan
-        return None
+        name = match_name(raw_name, self.loans)
+        return self.loans[name] if name is not None else None
 
     def secondary_names(self) -> list:
         return [name for name, loan in self.loans.items() if loan.secondary_active]

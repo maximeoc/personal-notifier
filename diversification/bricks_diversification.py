@@ -1,4 +1,4 @@
-"""Bricks (app.bricks.co) portfolio balance fetcher.
+﻿"""Bricks (app.bricks.co) portfolio balance fetcher.
 
 Same family as bienpreter_diversification.py / monefit_diversification.py:
 Bricks is a French real-estate crowdfunding platform (immobilier), not
@@ -204,6 +204,7 @@ try:
         fill_current_month_bonus_breakdown,
         fill_bricks_project_geo_amounts,
         fill_geographic_repartition_uninvested_amount,
+        fill_remaining_duration_amounts,
     )
     from shared.report_date import get_report_now, is_current_month
 except ModuleNotFoundError:
@@ -217,9 +218,12 @@ except ModuleNotFoundError:
         fill_current_month_bonus_breakdown,
         fill_bricks_project_geo_amounts,
         fill_geographic_repartition_uninvested_amount,
+        fill_remaining_duration_amounts,
     )
     from shared.report_date import get_report_now, is_current_month
 
+from shared.rate_sheet import fill_rate_amounts
+from shared.remaining_duration import RateWeights, overdue_months_and_days, remaining_months_and_days
 from shared.session_cache import get_or_refresh_session
 from shared.loan_durations import durations_from_json_items, record_platform_loan_durations
 from shared.state import load_state, save_state
@@ -236,7 +240,7 @@ HOME_METRICS_URL = "https://api.bricks.co/investor/portfolio/wealth/home-metrics
 REVENUE_API_URL = "https://api.bricks.co/investor/portfolio/revenue"
 WALLET_TRANSACTIONS_URL = "https://api.bricks.co/wallet-transactions"
 PORTFOLIO_PROPERTIES_URL = "https://api.bricks.co/investor/portfolio/properties"
-# financialStatus de l'API -> section de "Répartition géographique" (absent = projet sain, sans en-tête).
+# financialStatus de l'API -> statut (absent = projet sain), utilisé pour regrouper retards/défauts dans l'onglet "durée".
 _PROJECT_STATUS_SECTIONS = {"repayment-delay": "delay", "repayment-default": "default"}
 # Server-side cap, confirmed live (requesting take=2000 still only returned 50).
 WALLET_TRANSACTIONS_PAGE_SIZE = 50
@@ -494,6 +498,150 @@ def fetch_active_project_geo_amounts(session: requests.Session, all_entries: lis
         len(project_amounts), parsed_total, {s: list(project_statuses.values()).count(s) for s in set(project_statuses.values())},
     )
     return project_amounts, project_statuses
+
+
+def fetch_project_maturity_dates(session: requests.Session) -> dict:
+    """``{nom de projet: date d'échéance}`` des projets en cours, depuis ``lastEcheancePeriod`` ("YYYY-MM",
+    mois du dernier remboursement, vérifié en direct le 2026-10-16 : ``contractRemainingMonths`` en est l'écart
+    en mois et ``principalRepayments`` y place le solde du capital). Bricks ne donne pas le jour : on retient la
+    fin de ce mois, échéance au plus tard."""
+    resp = session.get(PORTFOLIO_PROPERTIES_URL, timeout=15)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Bricks portfolio properties endpoint returned status {resp.status_code}")
+    resp.encoding = "utf-8"
+    maturities = {}
+    for project in (resp.json() or {}).get("ongoing") or []:
+        name = (project.get("propertyName") or "").strip()
+        period = project.get("lastEcheancePeriod")
+        if not name or not period:
+            continue
+        year, month = (int(part) for part in period.split("-"))
+        next_month_start = date(year + (month == 12), month % 12 + 1, 1)
+        maturities[name] = next_month_start - timedelta(days=1)
+    return maturities
+
+
+def fetch_project_missed_payment_dates(session: requests.Session) -> dict:
+    """``{nom de projet: date du coupon manqué}`` des projets en retard/défaut (``financialStatus`` =
+    ``repayment-delay``/``repayment-default``), depuis ``GET /investor/portfolio/properties/{propertyId}``.
+
+    Ce détail donne ``nextRevenue.month`` ("YYYY-MM", prochain coupon à verser) : pour un projet sain c'est
+    toujours le mois suivant, pour un projet en retard/défaut c'est le mois du coupon non versé, parfois déjà
+    passé (vérifié en direct le 2026-10-16 : p. ex. "2026-07" pour un projet en retard dont le dernier coupon
+    versé date du 2026-06-08). Bricks ne donne pas le jour : on reprend celui du dernier coupon versé
+    (``pastRevenues``, toujours entre le 5 et le 10 du mois en direct), à défaut le 8. Les projets dont le détail
+    est introuvable sont ignorés (repli sur l'échéance dans :func:`aggregate_remaining_durations`)."""
+    resp = session.get(PORTFOLIO_PROPERTIES_URL, timeout=15)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Bricks portfolio properties endpoint returned status {resp.status_code}")
+    resp.encoding = "utf-8"
+    missed = {}
+    for project in (resp.json() or {}).get("ongoing") or []:
+        name = (project.get("propertyName") or "").strip()
+        if not name or project.get("financialStatus") not in _PROJECT_STATUS_SECTIONS:
+            continue
+        try:
+            detail_resp = session.get(f"{PORTFOLIO_PROPERTIES_URL}/{project.get('propertyId')}", timeout=15)
+            if detail_resp.status_code != 200:
+                raise RuntimeError(f"HTTP {detail_resp.status_code}")
+            detail = detail_resp.json() or {}
+            year, month = (int(part) for part in detail["nextRevenue"]["month"].split("-"))
+            past = detail.get("pastRevenues") or []
+            day = int(past[-1]["date"][8:10]) if past else 8
+            next_month_start = date(year + (month == 12), month % 12 + 1, 1)
+            missed[name] = date(year, month, min(day, (next_month_start - timedelta(days=1)).day))
+        except Exception as exc:
+            log.warning("No missed-coupon date for Bricks project %r: %s", name, exc)
+    return missed
+
+
+def fetch_project_rates(session: requests.Session) -> dict:
+    """``{nom de projet: taux d'intérêt annuel en %}`` des projets en cours, depuis ``property.interestRate`` de
+    ``GET /investor/portfolio/properties/{propertyId}`` (ex. ``10.5`` ; vérifié en direct le 2026-10-26 : en pourcent,
+    cohérent avec le coupon mensuel ``nextRevenue``). La liste ne le donne pas. Un projet dont le taux est
+    introuvable est ignoré."""
+    resp = session.get(PORTFOLIO_PROPERTIES_URL, timeout=15)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Bricks portfolio properties endpoint returned status {resp.status_code}")
+    resp.encoding = "utf-8"
+    project_rates = {}
+    for project in (resp.json() or {}).get("ongoing") or []:
+        name = (project.get("propertyName") or "").strip()
+        if not name:
+            continue
+        try:
+            detail_resp = session.get(f"{PORTFOLIO_PROPERTIES_URL}/{project.get('propertyId')}", timeout=15)
+            if detail_resp.status_code != 200:
+                raise RuntimeError(f"HTTP {detail_resp.status_code}")
+            project_rates[name] = float(detail_resp.json()["property"]["interestRate"])
+        except Exception as exc:
+            log.warning("No interest rate for Bricks project %r: %s", name, exc)
+    return project_rates
+
+
+def fetch_project_base_terms(session: requests.Session) -> dict:
+    """``{nom de projet: (mois, 0)}`` durée de base (d'origine) des projets en cours, depuis
+    ``investmentHorizonInMonths`` de ``GET /investor/portfolio/properties`` (horizon de placement annoncé à la
+    souscription, vérifié en direct le 2026-10-26 ; égal à ``property.investmentHorizonInMonths`` du détail). Les
+    prolongations ne sont pas comptées : ``contractDuration.totalMonths`` du détail les inclut (p. ex. 12 -> 24).
+    Un projet sans horizon valide est ignoré."""
+    resp = session.get(PORTFOLIO_PROPERTIES_URL, timeout=15)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Bricks portfolio properties endpoint returned status {resp.status_code}")
+    resp.encoding = "utf-8"
+    base_terms = {}
+    for project in (resp.json() or {}).get("ongoing") or []:
+        name = (project.get("propertyName") or "").strip()
+        try:
+            months = int(project.get("investmentHorizonInMonths"))
+        except (TypeError, ValueError):
+            continue
+        if name and months > 0:
+            base_terms[name] = (months, 0)
+    return base_terms
+
+
+def aggregate_remaining_durations(
+    project_amounts: dict, maturities: dict, today: date, project_statuses: dict = None, missed_dates: dict = None,
+    rates=None, project_rates: dict = None, base_terms: dict = None,
+) -> dict:
+    """Groupe les projets (même clé que la répartition géographique) par durée restante à `today`
+    (mois, jours) : ``{projet: {(mois, jours): capital restant}}``. Les projets sans échéance connue
+    sont ignorés (avec un avertissement).
+
+    Si `rates` (:class:`shared.remaining_duration.RateWeights`) est fourni, y ajoute le taux annuel en % de chaque
+    projet (`project_rates`, voir :func:`fetch_project_rates`) pondéré par son capital restant, ainsi que sa durée
+    de base `base_terms` (voir :func:`fetch_project_base_terms`, None si inconnue) pour l'onglet "taux".
+
+    Projet en retard ("delay") ou en défaut ("default") d'après `project_statuses` : il est groupé par
+    :func:`overdue_months_and_days` depuis le coupon manqué `missed_dates` (voir
+    :func:`fetch_project_missed_payment_dates`), à défaut depuis son échéance si elle est dépassée
+    (retard ``(-mois, -jours)``, défaut ``(mois, jours, "default")``). Sinon (dont retard sans date passée),
+    durée restante normale."""
+    result = {}
+    for name, countries in project_amounts.items():
+        maturity = maturities.get(name)
+        term = None
+        status = (project_statuses or {}).get(name)
+        if status in ("delay", "default"):
+            for due in ((missed_dates or {}).get(name), maturity):
+                if due is not None:
+                    term = overdue_months_and_days(today, due, default=status == "default")
+                    if term is not None:
+                        break
+        if term is None:
+            if maturity is None:
+                log.warning("No maturity date found for Bricks project %r (%.2f EUR) - skipped.", name, sum(countries.values()))
+                continue
+            term = remaining_months_and_days(today, maturity)
+        durations = result.setdefault(name, {})
+        durations[term] = round(durations.get(term, 0.0) + sum(countries.values()), 2)
+        if rates is not None:
+            base_term = (base_terms or {}).get(name)
+            if base_term is None:
+                log.warning("No base term found for Bricks project %r - excluded from the 'taux' sheet.", name)
+            rates.add(name, term, sum(countries.values()), (project_rates or {}).get(name), base_term=base_term)
+    return result
 
 
 def fetch_wallet_transactions_page(session: requests.Session, cursor: int) -> dict:
@@ -846,10 +994,14 @@ def compute_xirr_block_as_of(
     avg_idle_cash_lifetime = compute_average_idle_cash(all_entries, since_inception_str, end_date_str)
     lifetime_gross_interest = _lifetime_sum_as_of(all_entries, {_INTEREST_KIND}, end_date)
     if outstanding_as_of > 0:
-        cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + outstanding_as_of)
-        lifetime_yield_rate = lifetime_gross_interest / outstanding_as_of
+        # Time-weighted like the idle cash: end-of-period balance understates the yield on a fast-growing account.
+        avg_invested_lifetime = compute_average_balances(all_entries, since_inception_date, end_date)[0]
+        if avg_invested_lifetime is None or avg_invested_lifetime <= 0:
+            avg_invested_lifetime = outstanding_as_of
+        cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + avg_invested_lifetime)
+        lifetime_yield_rate = lifetime_gross_interest / avg_invested_lifetime
         cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
-        missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + outstanding_as_of)
+        missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + avg_invested_lifetime)
     else:
         # Nothing invested at end_date: no yield rate to extrapolate idle cash from.
         missed_earnings = 0.0
@@ -1105,13 +1257,15 @@ def run() -> None:
         section="Crowdfunding immobilier",
     )
 
-    # "Répartition géographique" : une ligne par projet (statut en sections, pays en colonne, comme Lande) ;
-    # la ligne "Bricks" en est la somme. Relevés LIVE (sans date) : mois courant uniquement.
+    # "Répartition géographique" : une ligne par projet (pays en colonne, comme Lande) ; la ligne "Bricks" en est
+    # la somme. Retards/défauts ne sont plus rangés en sections ici, ils sont dans l'onglet "durée".
+    # Relevés LIVE (sans date) : mois courant uniquement.
     if current_month:
+        project_amounts = None
         duration_items = []
         try:
             project_amounts, project_statuses = fetch_active_project_geo_amounts(session, all_entries, duration_items)
-            for issue in fill_bricks_project_geo_amounts(project_amounts, project_statuses):
+            for issue in fill_bricks_project_geo_amounts(project_amounts):
                 log.warning("Bricks geographic breakdown: %s", issue)
         except Exception:
             log.exception("Failed to fetch/update Bricks' per-project geographic breakdown.")
@@ -1122,6 +1276,31 @@ def run() -> None:
         record_platform_loan_durations(
             "Bricks", "Crowdfunding immobilier", lambda: durations_from_json_items(duration_items),
         )
+
+        # Own try/except: the "durée" tab is a secondary view, its failure
+        # must not fail the whole run.
+        if project_amounts:
+            rates = RateWeights()
+            try:
+                fill_remaining_duration_amounts(
+                    "Bricks",
+                    aggregate_remaining_durations(
+                        project_amounts, fetch_project_maturity_dates(session), today_date,
+                        project_statuses, fetch_project_missed_payment_dates(session),
+                        rates=rates, project_rates=fetch_project_rates(session),
+                        base_terms=fetch_project_base_terms(session),
+                    ),
+                    platform_level=True,
+                    projects=True,
+                    rates=rates,
+                )
+            except Exception:
+                log.exception("Failed to update the 'durée' sheet for Bricks.")
+            else:
+                try:
+                    fill_rate_amounts("Bricks", rates, platform_level=True, projects=True)
+                except Exception:
+                    log.exception("Failed to update the 'taux' sheet for Bricks.")
 
 
 if __name__ == "__main__":

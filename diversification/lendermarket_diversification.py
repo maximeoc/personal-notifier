@@ -154,7 +154,7 @@ Optional:
 import calendar
 import logging
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -166,6 +166,15 @@ from shared.google_sheet import (
     fill_current_month_bonus_breakdown,
     fill_geographic_repartition_amounts,
     fill_geographic_repartition_uninvested_amount,
+    fill_remaining_duration_amounts,
+)
+from shared.rate_sheet import fill_rate_amounts
+from shared.remaining_duration import (
+    RateWeights,
+    base_term_between,
+    base_term_from_days,
+    overdue_months_and_days,
+    remaining_months_and_days,
 )
 from shared.loan_durations import durations_from_json_items, parse_amount, record_platform_loan_durations
 from shared.report_date import get_report_now, is_current_month
@@ -178,7 +187,7 @@ from shared.xirr_waterfall import compute_waterfall_xirr_shares
 
 load_dotenv()
 
-from monitors.lendermarket_monitor import (
+from monitors.lendermarket_invest_bot import (
     login, LENDERMARKET_EMAIL, LENDERMARKET_PASSWORD, _xsrf_headers, fetch_account_balance,
     fetch_account_pending_payments,
 )
@@ -261,6 +270,78 @@ def aggregate_by_lender(investments: list) -> list:
     lenders = [{"lender": lender, "remaining_principal": amount} for lender, amount in totals.items()]
     lenders.sort(key=lambda l: l["remaining_principal"], reverse=True)
     return lenders
+
+
+def _base_term(loan: dict):
+    """Original term of a loan as (months, days): from `lenderIssueDate` to
+    `initialDueDate` (the maturity before any extension), verified live
+    2026-10-26 on 134 investments. `totalTermInDays` (= finalPaymentDate -
+    lenderIssueDate) includes the extensions used so it's only the fallback
+    when those dates are missing. None if undeterminable."""
+    try:
+        return base_term_between(date.fromisoformat(loan["lenderIssueDate"][:10]), date.fromisoformat(loan["initialDueDate"][:10]))
+    except (KeyError, TypeError, ValueError):
+        return base_term_from_days(loan.get("totalTermInDays"))
+
+
+def aggregate_remaining_durations(investments: list, today: date, rates=None) -> dict:
+    """Group investments by loan originator (same key as aggregate_by_lender),
+    then by remaining term as of `today` (months, days):
+    {originator: {(months, days): remaining principal}}. The maturity date is
+    the loan's `finalPaymentDate` (already in the investments API response,
+    verified live 2026-10-16). Investments without it are skipped (with a
+    warning).
+
+    Late loans (`loan.loanOverdueDays` > 0, verified live 2026-10-16: 21 of
+    128 active investments, all with `loan.status` still "ACTIVE" and
+    `nextPaymentDate` = the missed due date = today - loanOverdueDays) are
+    grouped by overdue_months_and_days() since that missed payment date
+    instead, falling back to today - loanOverdueDays. Defaulted loans
+    (`loan.status` "DEFAULT"/"DEFAULTED" - INFERRED, no defaulted loan on the
+    account to verify; active/finished investments only ever showed ACTIVE/
+    FINISHED) get the "default" key variant. Otherwise the remaining term
+    above applies."""
+    result = {}
+    for inv in investments:
+        loan = inv.get("loan") or {}
+        lender_name = (
+            (inv.get("lender") or {}).get("displayName")
+            or (loan.get("lender") or {}).get("displayName")
+            or "Fournisseur inconnu"
+        )
+        try:
+            remaining = float(inv.get("remainingPrincipal"))
+        except (TypeError, ValueError):
+            remaining = 0.0
+        try:
+            maturity = date.fromisoformat(loan["finalPaymentDate"][:10])
+        except (KeyError, TypeError, ValueError):
+            log.warning("No maturity date found for an investment of %s (%.2f EUR) - skipped.", lender_name, remaining)
+            continue
+        try:
+            overdue_days = int(loan.get("loanOverdueDays") or 0)
+        except (TypeError, ValueError):
+            overdue_days = 0
+        is_default = str(loan.get("status") or "").upper() in ("DEFAULT", "DEFAULTED")
+        term = None
+        if overdue_days > 0 or is_default:
+            try:
+                missed_due_date = date.fromisoformat(inv["nextPaymentDate"][:10])
+            except (KeyError, TypeError, ValueError):
+                missed_due_date = None
+            term = missed_due_date and overdue_months_and_days(today, missed_due_date, default=is_default)
+            if term is None and overdue_days > 0:
+                term = overdue_months_and_days(today, today - timedelta(days=overdue_days), default=is_default)
+        if term is None:
+            term = remaining_months_and_days(today, maturity)
+        durations = result.setdefault(lender_name, {})
+        durations[term] = durations.get(term, 0.0) + remaining
+        if rates is not None:
+            base_term = _base_term(loan)
+            if base_term is None:
+                log.warning("No base term found for an investment of %s (%.2f EUR) - excluded from the 'taux' sheet.", lender_name, remaining)
+            rates.add(lender_name, term, remaining, loan.get("interestRate"), base_term=base_term)  # loan.interestRate is already in percent (e.g. "12.00")
+    return result
 
 
 def fetch_statement_summary(session: requests.Session, investor_id: str, start_date: date, end_date: date) -> dict:
@@ -472,6 +553,24 @@ def _invested_balance_at_month_end(monthly_summaries: dict, live_total_account_v
     )
     total_account_value = live_total_account_value - value_change_since
     return total_account_value - monthly_summaries[month_key]["closing_balance"]
+
+
+def compute_average_invested(monthly_summaries_as_of: dict, monthly_summaries: dict, live_total: float):
+    """Invested counterpart of compute_average_idle_cash(): day-weighted average of each month's
+    (opening+closing)/2 invested balance, rebuilt backward from the live total. None if unavailable."""
+    total_weighted = 0.0
+    total_days = 0
+    opening = 0.0
+    for month_key in sorted(monthly_summaries_as_of):
+        closing = _invested_balance_at_month_end(monthly_summaries, live_total, month_key)
+        if closing is None:
+            return None
+        days = monthly_summaries_as_of[month_key].get("days_covered") or 0
+        if days > 0:
+            total_weighted += (opening + closing) / 2 * days
+            total_days += days
+        opening = closing
+    return total_weighted / total_days if total_days else None
 
 
 def run() -> None:
@@ -823,11 +922,15 @@ def run() -> None:
     # Lifetime shares don't need the previous month's balances (first month of the account).
     if xirr_value is not None and signed_cashflows is not None and monthly_summaries_as_of and total_invested > 0:
         avg_idle_cash_lifetime = compute_average_idle_cash(monthly_summaries_as_of)
-        cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + total_invested)
+        # Time-weighted like the idle cash: end-of-period total_invested understates the yield on a fast-growing account.
+        avg_invested_lifetime = compute_average_invested(monthly_summaries_as_of, monthly_summaries, live_total_account_value)
+        if avg_invested_lifetime is None or avg_invested_lifetime <= 0:
+            avg_invested_lifetime = total_invested
+        cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + avg_invested_lifetime)
         lifetime_gross_interest_total = sum(s["interest_received"] for s in monthly_summaries_as_of.values())
-        lifetime_yield_rate = lifetime_gross_interest_total / total_invested
+        lifetime_yield_rate = lifetime_gross_interest_total / avg_invested_lifetime
         cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
-        missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_invested)
+        missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + avg_invested_lifetime)
         lifetime_fees_total = sum(s["fees"] for s in monthly_summaries_as_of.values())
         # Interest inside pending payments is in the account value but not yet in the statement.
         ledger_value = sum(
@@ -931,6 +1034,20 @@ def run() -> None:
             "Lendermarket", "Crowdlending",
             lambda: durations_from_json_items((inv, parse_amount(inv.get("remainingPrincipal"))) for inv in investments),
         )
+        # Own try/except: the "durée" tab is a secondary view, its failure
+        # must not fail the whole run.
+        try:
+            rates = RateWeights()
+            fill_remaining_duration_amounts(
+                "Lendermarket", aggregate_remaining_durations(investments, today_date, rates=rates), rates=rates
+            )
+        except Exception:
+            log.exception("Failed to update the 'durée' sheet for Lendermarket.")
+
+        try:
+            fill_rate_amounts("Lendermarket", rates)
+        except Exception:
+            log.exception("Failed to update the 'taux' sheet for Lendermarket.")
 
 
 if __name__ == "__main__":

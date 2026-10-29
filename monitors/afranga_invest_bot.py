@@ -58,9 +58,11 @@ load_dotenv()
 from diversification.afranga_diversification import _HEADERS, fetch_uninvested_balance, login
 from shared.cron_schedule import apply_startup_jitter, ensure_schedule
 from shared.google_sheet import get_geo_platform_snapshot
+from shared.missing_loans import TRANSIENT_GRACE_SECONDS, report_missing_loans
 from shared.notifier import send_afranga_invest_summary_email
 from shared.robot_config import Candidate, build_tracker, get_platform_config, plan_allocations
 from shared.session_cache import get_or_refresh_session
+from shared.state import load_state, save_state
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("afranga_invest_bot")
@@ -70,6 +72,7 @@ SECONDARY_PAGE_URL = f"{BASE}/profile/invest-sm"
 PRIMARY_PAGE_URL = f"{BASE}/profile/invest"
 
 SESSION_STATE_FILE = Path(__file__).parent / "afranga_invest_session_state.json"
+STATE_FILE = Path(__file__).parent / "afranga_invest_state.json"
 DIAGNOSTICS_FILE = Path(__file__).parent / "afranga_invest_diagnostics.log"
 CRON_SCHEDULE_STATE_FILE = Path(__file__).parent / "afranga_cron_schedule_state.json"
 AFRANGA_CRON_JOB_ID = os.environ.get("AFRANGA_CRON_JOB_ID")
@@ -444,6 +447,7 @@ def run() -> None:
         "invested": [], "plan": [], "probed": False,
     }
     error = None
+    config = None
     try:
         session = requests.Session()
         balance, _extra = get_or_refresh_session(
@@ -475,6 +479,24 @@ def run() -> None:
             geo_snapshot = None
         tracker = build_tracker(config, balance, geo_snapshot)
 
+        # Companies searched by their sheet name: mail (once) when none of the
+        # fetched listings has a loan of a company flagged in the sheet.
+        state = load_state(STATE_FILE, {"missing_loans": {}})
+        seen_names, checked_names = set(), set()
+        all_names = sorted(set(config.active_names()) | set(config.secondary_names()))
+
+        def check_originators(expected: list, rows: list) -> None:
+            checked_names.update(expected)
+            for row in rows:
+                loan = config.find_loan((row.get("originator") or {}).get("name"))
+                if loan is not None:
+                    seen_names.add(loan.name)
+            report_missing_loans(
+                "Afranga", {name: name in seen_names for name in checked_names},
+                state.setdefault("missing_loans", {}), all_names=all_names, grace_seconds=TRANSIENT_GRACE_SECONDS,
+            )
+            save_state(STATE_FILE, state)
+
         budget = balance
         if config.secondary_names():
             filters = {}
@@ -482,6 +504,7 @@ def run() -> None:
             _range_filters(filters, "discount", *config.secondary_bounds("min_premium", "max_premium"))
             _range_filters(filters, "remaining_term", *config.secondary_bounds("min_months", "max_months"))
             market = fetch_market(session, SECONDARY_PAGE_URL, filters)
+            check_originators(config.secondary_names(), market.rows)
             lines = plan_secondary(market.rows, tracker, budget)
             log.info("Secondary: %d listing(s) fetched, %d planned.", len(market.rows), len(lines))
             stats["plan"] += [_line_summary(line) for line in lines]
@@ -492,6 +515,7 @@ def run() -> None:
             filters = {}
             _range_filters(filters, "interest_rate_percent", config.lowest_min_rate(), None)
             market = fetch_market(session, PRIMARY_PAGE_URL, filters)
+            check_originators(config.active_names(), market.rows)
             lines = plan_primary(market.rows, tracker, budget)
             log.info("Primary: %d listing(s) fetched, %d planned.", len(market.rows), len(lines))
             stats["plan"] += [_line_summary(line) for line in lines]
@@ -503,10 +527,12 @@ def run() -> None:
     finally:
         _log_diagnostics("run_summary", stats=stats, error=error)
         had_problem = bool(error or stats["failures"])
-        # dry/probe runs only email on error; diagnostics are attached only when something went wrong.
-        if error or (MODE == "live" and (stats["plan"] or stats["attempts"])):
+        # Email only on error or when a real purchase was attempted (dry/probe never buy);
+        # diagnostics are attached only when something went wrong.
+        if error or (MODE == "live" and stats["attempts"]):
             send_afranga_invest_summary_email(
-                stats, error=error, diagnostics_text=_collect_run_diagnostics(run_started_at) if had_problem else None
+                stats, error=error, diagnostics_text=_collect_run_diagnostics(run_started_at) if had_problem else None,
+                robot_config=config,
             )
     if error:
         sys.exit(1)

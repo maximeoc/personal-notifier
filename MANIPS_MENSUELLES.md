@@ -64,7 +64,7 @@ python -m portfolio.sheet_pee
 
 - Lignes « valo totale » et « Rendements % » des blocs mis à jour (Bourse, métaux, PEE CGI).
 - Totaux patrimoine (Bourse, Or, Argent, PEE) cohérents avec les blocs.
-- Cap Lendermarket à 30 € par investissement : `MAX_INVESTMENT_AMOUNT` dans `monitors/lendermarket_monitor.py`.
+- Cap Lendermarket par investissement : colonnes montant min/max de l'onglet « config robots » (le bot est maintenant `monitors/lendermarket_invest_bot.py`).
 - L'onglet `dashboard 2026 (to delete)` est une sauvegarde : le supprimer une fois le dashboard validé.
 
 ## Dépannage rapide

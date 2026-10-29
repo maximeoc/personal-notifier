@@ -202,7 +202,7 @@ import re
 import sys
 import logging
 from html.parser import HTMLParser
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 import fitz
 import requests
@@ -213,10 +213,11 @@ from shared.google_sheet import (
     fill_current_month_bonus_breakdown,
     fill_geographic_repartition_uninvested_amount,
     fill_lande_loan_geo_amounts,
+    fill_remaining_duration_amounts,
 )
-from shared.loan_durations import (
-    durations_from_labelled_pages, labelled_pairs_from_html, record_platform_loan_durations,
-)
+from shared.loan_durations import DurationExtraction, LoanDuration, months_between, record_platform_loan_durations
+from shared.rate_sheet import fill_rate_amounts
+from shared.remaining_duration import RateWeights, base_term_from_days, overdue_months_and_days, remaining_months_and_days
 from shared.report_date import get_report_date, is_current_month
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
 from shared.monthly_yield_waterfall import compute_monthly_yield_shares
@@ -246,6 +247,7 @@ _TRANSACTION_DATE_RE = re.compile(r'<p class="mt-1 m-0 text-xs text-neutral-500"
 _TRANSACTION_AMOUNT_RE = re.compile(r'<span class="text-(?:brand-green|rose-600)">([+-])€[\s\xa0]*([\d.,\s\xa0]+?)</span>')
 _LOAN_ID_RE = re.compile(r"/fr/investors/loans/(\d+)(?:$|[/?#])")
 _EURO_AMOUNT_RE = re.compile(r"€\s*(-?[\d.,\s\xa0]+)")
+_TABLE_DATE_RE = re.compile(r"^\d{2}\.\d{2}\.\d{4}$")
 
 LANDE_COUNTRY_CODES = {
     "ZA": "Afrique du Sud", "DE": "Allemagne", "AR": "Argentine",
@@ -607,19 +609,19 @@ class _InvestmentTableParser(HTMLParser):
             self.row = None
 
 
-def fetch_active_loan_geo_amounts(session: requests.Session, duration_rows: dict | None = None) -> tuple:
-    """Fetch current Lande investments as ``(loan_amounts, loan_statuses)``
-    where ``loan_amounts`` is ``loan id -> country -> remaining principal``
-    and ``loan_statuses`` is ``loan id -> payment_status filter``.
+def fetch_active_loan_geo_amounts(session: requests.Session) -> tuple:
+    """Fetch current Lande investments as ``(loan_amounts, loan_statuses, due_dates)``
+    where ``loan_amounts`` is ``loan id -> country -> remaining principal``,
+    ``loan_statuses`` is ``loan id -> payment_status filter`` and ``due_dates``
+    is ``loan id -> "Paiement à venir" date`` (the missed payment's date for a
+    late/defaulted loan).
     The site's current-investments table contains
     one parent row per loan followed by one detail row per investment
     contract; several contracts for the same loan are summed together.
-    If ``duration_rows`` (dict) is given, it receives the table's column
-    headers (``"headers"``) and each loan's parent-row cells (``"cells"``:
-    loan id -> texts), used for the loan-duration tab.
     """
     loan_amounts = {}
     loan_statuses = {}
+    due_dates = {}
     parent_rows = 0
     # Le tableau par défaut masque les prêts « Défaut » (vérifié en live) : on parcourt chaque filtre actif.
     for payment_status in LANDE_ACTIVE_PAYMENT_STATUSES:
@@ -631,7 +633,7 @@ def fetch_active_loan_geo_amounts(session: requests.Session, duration_rows: dict
         if not response.ok:
             raise RuntimeError(f"Lande investments page returned status {response.status_code}")
         page_amounts = {}
-        parent_rows += _parse_investments_page(response.text, page_amounts, duration_rows)
+        parent_rows += _parse_investments_page(response.text, page_amounts, due_dates)
         loan_amounts.update(page_amounts)
         # Le filtre « current » liste aussi les prêts en retard : les filtres suivants, plus précis, écrasent son statut.
         for loan_id in page_amounts:
@@ -649,76 +651,161 @@ def fetch_active_loan_geo_amounts(session: requests.Session, duration_rows: dict
         "Lande current investments: %d loan row(s), %d loan(s) with remaining principal (%.2f EUR).",
         parent_rows, len(loan_amounts), parsed_total,
     )
-    return loan_amounts, loan_statuses
+    return loan_amounts, loan_statuses, due_dates
 
-
-def fetch_loan_detail_labels(session: requests.Session, loan_id: str) -> dict:
-    """Intitulés/valeurs de la fiche d'un prêt (le tableau des investissements n'a aucune colonne de durée)."""
-    url = f"https://lande.finance/fr/investors/loans/{loan_id}"
-    response = session.get(url, timeout=30)
-    log.info("GET loan page %s: status=%s", loan_id, response.status_code)
+def _fetch_loan_page(session: requests.Session, loan_id: str) -> str:
+    response = session.get(f"https://lande.finance/fr/investors/loans/{loan_id}", timeout=30)
     _check_authenticated(response)
     response.raise_for_status()
-    return labelled_pairs_from_html(response.text)
+    response.encoding = "utf-8"
+    return response.text
 
 
-def collect_loan_duration_pages(session: requests.Session, duration_rows: dict, loan_amounts: dict) -> list:
-    """[({intitulé: valeur} du prêt, encours)] : colonnes du tableau + fiche détail de chaque prêt actif."""
-    headers = duration_rows.get("headers") or []
-    pages = []
+def _parse_loan_maturity_date(page_html: str) -> date | None:
+    parser = _InvestmentTableParser()
+    parser.feed(page_html)
+    dates = [
+        datetime.strptime(row["cells"][1], "%d.%m.%Y").date()
+        for row in parser.rows
+        if len(row["cells"]) >= 5 and row["cells"][0].isdigit() and _TABLE_DATE_RE.match(row["cells"][1])
+    ]
+    return max(dates) if dates else None
+
+
+_LOAN_RATE_RE = re.compile(r"Taux d'int[ée]r[êe]t\s*([\d]+(?:[.,]\d+)?)\s*%", re.IGNORECASE)
+
+
+def _parse_loan_rate(page_html: str) -> float | None:
+    """Annual interest rate (%) of a loan from its "Taux d'intérêt 13%" line (verified live 2026-10-26)."""
+    text = html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", page_html)))
+    match = _LOAN_RATE_RE.search(text.replace("’", "'"))
+    return float(match.group(1).replace(",", ".")) if match else None
+
+
+_LOAN_TERM_RE = re.compile(r"\bTerme\s*(\d+)\s*(m|mois|months?|j|jours?|d|days?)\b", re.IGNORECASE)
+
+
+def _parse_loan_base_term(page_html: str) -> tuple | None:
+    """Base term (months, days) of a loan from its "Terme 12m" line (verified live 2026-10-26); None if absent."""
+    text = html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", page_html)))
+    match = _LOAN_TERM_RE.search(text)
+    if not match:
+        return None
+    value, unit = int(match.group(1)), match.group(2).lower()
+    return (value, 0) if unit.startswith("m") else base_term_from_days(value)
+
+
+def fetch_loan_maturity_date(session: requests.Session, loan_id: str) -> date | None:
+    """Maturity date of a loan: the last date of the payment schedule
+    ("Calendrier" table: # | Date | Principal | ...) on its project page
+    /fr/investors/loans/<id> (verified live 2026-10-16; the investments
+    table itself only shows the next payment). None if no schedule found."""
+    return _parse_loan_maturity_date(_fetch_loan_page(session, loan_id))
+
+
+def aggregate_remaining_durations(
+    session: requests.Session, loan_amounts: dict, today: date, loan_statuses: dict | None = None, due_dates: dict | None = None,
+    rates: RateWeights | None = None, loan_dates: dict | None = None,
+) -> dict:
+    """Group loans by loan id (same key as the geographic breakdown rows),
+    then by remaining term as of `today` (months, days):
+    {loan_id: {(months, days): remaining principal}}. A loan that is late
+    (any payment_status other than "current") or in default ("default") is
+    grouped by how long ago its missed payment was due (the "Paiement à
+    venir" date Lande shows) instead - see overdue_months_and_days().
+    Loans whose maturity can't be determined are skipped (with a warning).
+    `rates` (optional) collects each loan's interest rate (%) from its project page.
+    `loan_dates` (optional) receives {loan_id: (amount, maturity, base_term)} for the « durées prêts » tab."""
+    loan_statuses = loan_statuses or {}
+    due_dates = due_dates or {}
+    result = {}
     for loan_id, countries in loan_amounts.items():
-        cells = duration_rows.get("cells", {}).get(loan_id, [])
-        offset = max(0, len(cells) - len(headers))
-        labels = {h: cells[i + offset] for i, h in enumerate(headers) if h and i + offset < len(cells)}
-        try:
-            for label, value in fetch_loan_detail_labels(session, loan_id).items():
-                labels.setdefault(label, value)
-        except Exception:
-            log.exception("Lande loan %s: fiche détail illisible - durées de ce prêt ignorées.", loan_id)
-        pages.append((labels, sum(countries.values())))
-    return pages
+        amount = sum(countries.values())
+        status = loan_statuses.get(loan_id, "current")
+        term = None
+        page_html = None
+        maturity = None
+        if status != "current" and loan_id in due_dates:
+            term = overdue_months_and_days(today, due_dates[loan_id], default=status == "default")
+        if term is None:
+            try:
+                page_html = _fetch_loan_page(session, loan_id)
+                maturity = _parse_loan_maturity_date(page_html)
+            except Exception:
+                log.exception("Failed to fetch the maturity date of Lande loan %s.", loan_id)
+                maturity = None
+            if maturity is None:
+                log.warning("No maturity date found for Lande loan %s (%.2f EUR) - skipped.", loan_id, amount)
+                continue
+            term = remaining_months_and_days(today, maturity)
+        durations = result.setdefault(loan_id, {})
+        durations[term] = durations.get(term, 0.0) + amount
+        if rates is not None:
+            try:
+                if page_html is None:
+                    page_html = _fetch_loan_page(session, loan_id)
+                rates.add(
+                    loan_id, term, amount, _parse_loan_rate(page_html),
+                    base_term=_parse_loan_base_term(page_html),
+                )
+            except Exception:
+                log.exception("Failed to fetch the interest rate of Lande loan %s.", loan_id)
+        if loan_dates is not None:
+            loan_dates[loan_id] = (amount, maturity, _parse_loan_base_term(page_html) if page_html else None)
+    return result
 
 
-def _parse_investments_page(page_html: str, loan_amounts: dict, duration_rows: dict | None = None) -> int:
+def durations_from_loan_dates(loan_dates: dict, today: date) -> DurationExtraction:
+    """Durée initiale (« Terme ») et restante (dernière échéance du calendrier) de chaque prêt pour l'onglet
+    « durées prêts », à partir des fiches déjà lues par aggregate_remaining_durations()."""
+    loans = [
+        LoanDuration(
+            amount=amount,
+            term_months=base_term[0] + base_term[1] / 30.4375 if base_term else None,
+            remaining_months=max(months_between(today, maturity), 0.0) if maturity else None,
+        )
+        for amount, maturity, base_term in loan_dates.values()
+    ]
+    return DurationExtraction(loans, source="fiche prêt Lande (Terme / Calendrier)")
+
+
+def _parse_investments_page(page_html: str, loan_amounts: dict, due_dates: dict | None = None) -> int:
     """Ajoute dans `loan_amounts` les prêts non remboursés de la page ; retourne le nombre de lignes prêt.
-    Si `duration_rows` est fourni, y range les intitulés du tableau et les cellules de chaque ligne prêt."""
+    Si `due_dates` est fourni, y consigne la date « Paiement à venir » de chaque prêt (pour un prêt en
+    retard ou en défaut, c'est la date du paiement manqué)."""
     parser = _InvestmentTableParser()
     parser.feed(page_html)
     current_loan = None
     parent_rows = 0
-    pending_headers = []
 
     def save_current_loan():
         if current_loan and current_loan["amount"] > 0:
             loan_amounts[current_loan["id"]] = {
                 current_loan["country"]: current_loan["amount"]
             }
+            if due_dates is not None and current_loan["due"]:
+                due_dates[current_loan["id"]] = current_loan["due"]
 
     for row in parser.rows:
         loan_id = next(
             (match.group(1) for link in row["links"] if (match := _LOAN_ID_RE.search(link))),
             None,
         )
-        # Ligne d'intitulés (que des <th>) : mémorisée pour la durée des prêts, traitement inchangé ensuite.
-        if row.get("th") and not row.get("td") and not loan_id:
-            pending_headers = row["cells"]
         if loan_id:
             save_current_loan()
             parent_rows += 1
             cells = row["cells"]
-            if duration_rows is not None:
-                if pending_headers and not duration_rows.get("headers"):
-                    duration_rows["headers"] = pending_headers
-                duration_rows.setdefault("cells", {})[loan_id] = cells
             status = cells[3].casefold() if len(cells) > 3 else ""
             country_code = cells[4].strip().upper() if len(cells) > 4 else ""
             if "rembours" in status:
                 current_loan = None
                 continue
+            due_text = cells[5].strip() if len(cells) > 5 else ""
             current_loan = {
                 "id": loan_id,
                 "country": LANDE_COUNTRY_CODES.get(country_code, ""),
                 "amount": 0.0,
+                "due": datetime.strptime(due_text, "%d.%m.%Y").date() if _TABLE_DATE_RE.match(due_text) else None,
             }
             if country_code and not current_loan["country"]:
                 log.warning("Unknown Lande country code %r for loan %s.", country_code, loan_id)
@@ -803,22 +890,42 @@ def run(session: requests.Session | None = None) -> None:
     # La ligne "Lande" est une formule de somme de ses sous-lignes, gérée par fill_lande_loan_geo_amounts.
     available_funds = None
     if current_month:
-        duration_rows = {}
-        active_loan_amounts = {}
+        active_loan_amounts = None
         try:
-            active_loan_amounts, loan_statuses = fetch_active_loan_geo_amounts(session, duration_rows)
-            geo_issues = fill_lande_loan_geo_amounts(active_loan_amounts, loan_statuses)
+            active_loan_amounts, loan_statuses, loan_due_dates = fetch_active_loan_geo_amounts(session)
+            # Pas de statuts : retards/défauts ne sont plus rangés en sections ici, ils sont dans l'onglet "durée".
+            geo_issues = fill_lande_loan_geo_amounts(active_loan_amounts)
             for issue in geo_issues:
                 log.warning("Lande geographic breakdown: %s", issue)
         except Exception:
             log.exception("Failed to fetch/update Lande's active-loan geographic breakdown.")
 
-        record_platform_loan_durations(
-            PLATFORM_LABEL, "Crowdlending",
-            lambda: durations_from_labelled_pages(
-                collect_loan_duration_pages(session, duration_rows, active_loan_amounts)
-            ),
-        )
+        # Own try/except: the "durée" tab is a secondary view, its failure
+        # must not fail the whole run.
+        if active_loan_amounts is not None:
+            loan_dates = {}
+            try:
+                rates = RateWeights()
+                fill_remaining_duration_amounts(
+                    PLATFORM_LABEL,
+                    aggregate_remaining_durations(
+                        session, active_loan_amounts, report_date, loan_statuses, loan_due_dates, rates, loan_dates,
+                    ),
+                    platform_level=True,
+                    projects=True,
+                    rates=rates,
+                )
+            except Exception:
+                log.exception("Failed to update the 'durée' sheet for Lande.")
+            else:
+                try:
+                    fill_rate_amounts(PLATFORM_LABEL, rates, platform_level=True, projects=True)
+                except Exception:
+                    log.exception("Failed to update the 'taux' sheet for Lande.")
+            # Onglet « durées prêts » : réutilise les fiches lues ci-dessus.
+            record_platform_loan_durations(
+                PLATFORM_LABEL, "Crowdlending", lambda: durations_from_loan_dates(loan_dates, report_date),
+            )
 
         try:
             available_funds = fetch_available_funds(session)
@@ -1042,10 +1149,14 @@ def run(session: requests.Session | None = None) -> None:
         if (xirr_value is not None and signed_cashflows is not None and since_inception_date is not None
                 and lifetime_interest is not None and total_invested is not None and total_invested > 0):
             avg_idle_cash_lifetime = compute_average_idle_cash(all_entries, since_inception_date, today_date)
-            cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + total_invested)
-            lifetime_yield_rate = lifetime_interest / total_invested
+            # Time-weighted like the idle cash: end-of-period balance understates the yield on a fast-growing account.
+            avg_invested_lifetime = compute_average_balances(all_entries, since_inception_date, today_date)[0]
+            if avg_invested_lifetime is None or avg_invested_lifetime <= 0:
+                avg_invested_lifetime = total_invested
+            cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + avg_invested_lifetime)
+            lifetime_yield_rate = lifetime_interest / avg_invested_lifetime
             cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
-            missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_invested)
+            missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + avg_invested_lifetime)
 
             def _is_classified(label: str) -> bool:
                 return _is_interest(label) or _is_deposit(label) or _is_withdrawal(label) or _is_bonus(label) or _is_known_internal_movement(label)

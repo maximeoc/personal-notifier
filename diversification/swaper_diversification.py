@@ -99,7 +99,7 @@ Optional:
 import re
 import logging
 import sys
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -110,8 +110,11 @@ from shared.google_sheet import (
     fill_current_month_bonus_breakdown,
     fill_geographic_repartition_amounts,
     fill_geographic_repartition_uninvested_amount,
+    fill_remaining_duration_amounts,
 )
 from shared.loan_durations import durations_from_json_items, record_platform_loan_durations
+from shared.rate_sheet import fill_rate_amounts
+from shared.remaining_duration import RateWeights, base_term_between, base_term_from_days, overdue_months_and_days, remaining_months_and_days
 from shared.report_date import get_report_now, is_current_month
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
@@ -124,7 +127,7 @@ load_dotenv()
 from playwright.sync_api import sync_playwright
 
 from shared.browser_stealth import get_context_options, apply_stealth
-from monitors.swaper_monitor import login, SWAPER_EMAIL, SWAPER_PASSWORD, fetch_loans, extract_balance
+from monitors.swaper_invest_bot import login, SWAPER_EMAIL, SWAPER_PASSWORD, fetch_loans, extract_balance
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("swaper_diversification")
@@ -305,10 +308,12 @@ def fetch_open_investments(page) -> list:
     """Every open investment from `POST /rest/public/profile/invests` (the
     Open Investments page's own list; verified live 2026-10-16), paginated,
     merged over OPEN_INVESTMENTS_FILTERS (deduplicated by row "id").
-    Each row has "group" (the loan originator), "dueDate" (exact maturity,
-    "YYYY-MM-DD"), "ownAmount" (the investor's outstanding amount),
-    "nextPaymentDate" and "progressStatusDetail" (CURRENT / DELAYED /
-    EXTENDED). Rows whose "status" isn't "OPEN" are dropped."""
+    Each row has "group" (the loan originator, same name as the breakdown
+    widget), "dueDate" (exact maturity, "YYYY-MM-DD"), "ownAmount" (the
+    investor's outstanding amount), "nextPaymentDate" and
+    "progressStatusDetail" (CURRENT / DELAYED / EXTENDED; DELAYED = late,
+    see aggregate_remaining_durations()). Rows whose "status" isn't "OPEN"
+    are dropped."""
     investments = []
     seen_ids = set()
     for loan_status, status_detail in OPEN_INVESTMENTS_FILTERS:
@@ -352,6 +357,90 @@ def fetch_open_investments(page) -> list:
             log.warning("Hit OPEN_INVESTMENTS_MAX_PAGES (%d) - open investments may be incomplete.", OPEN_INVESTMENTS_MAX_PAGES)
 
     return investments
+
+
+def _parse_iso_date(value):
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+
+
+def _missed_payment_date(inv: dict):
+    """Due date of the payment a late investment missed: its
+    "nextPaymentDate", else the earliest unpaid ("OPEN") schedule item's
+    "dueDate". None if neither is usable."""
+    due = _parse_iso_date(inv.get("nextPaymentDate"))
+    if due is not None:
+        return due
+    unpaid = [
+        _parse_iso_date(item.get("dueDate")) for item in inv.get("scheduleItems") or []
+        if item.get("status") == "OPEN"
+    ]
+    unpaid = [d for d in unpaid if d is not None]
+    return min(unpaid) if unpaid else None
+
+
+def _base_term(inv: dict):
+    """Original term of an investment as (months, days) for the "taux" tab, or None. Swaper's rows carry
+    "loanTerm": {"unit": "MONTHS"|"DAYS", "value": N} (verified live 2026-10-26: 24 or 12 months for the long-term
+    loans, 30 days for a short-term one, equal to startDate -> dueDate); falls back to "startDate" ->
+    "dueDate" when it is missing or in another unit."""
+    term = inv.get("loanTerm")
+    if isinstance(term, dict):
+        unit = str(term.get("unit") or "").upper()
+        value = term.get("value")
+        if unit == "DAYS":
+            result = base_term_from_days(value)
+            if result is not None:
+                return result
+        elif unit == "MONTHS" and isinstance(value, int) and value > 0:
+            return (value, 0)
+    return base_term_between(_parse_iso_date(inv.get("startDate")), _parse_iso_date(inv.get("dueDate")))
+
+
+def aggregate_remaining_durations(investments: list, today: date, rates: RateWeights | None = None) -> dict:
+    """Group open investments by loan originator, then by remaining term as
+    of `today` (months, days): {originator: {(months, days): outstanding}}.
+    Investments without a parseable due date, or with nothing outstanding
+    (late loans already bought back have ownAmount 0), are skipped.
+
+    Swaper's only late signal is `progressStatusDetail` == "DELAYED" (the
+    enum is CURRENT / DELAYED / EXTENDED; verified live 2026-10-16 on 2
+    DELAYED loans, which `loanStatus="OPEN"` does not return). Such a loan is
+    grouped by how long ago its missed payment was due (`nextPaymentDate`,
+    else the earliest unpaid schedule item) when that date is in the past,
+    otherwise it keeps its remaining term. Swaper exposes no default status
+    (its loans are bought back by the originator), so none is flagged.
+
+    `rates` (optional RateWeights) collects each investment's
+    `interestRatePerYear` (already in percent, e.g. 14 or 12) and its original
+    term (see _base_term(), None excludes it from the "taux" tab)."""
+    result = {}
+    for inv in investments:
+        originator = (inv.get("group") or "Unknown").strip()
+        amount = float(inv.get("ownAmount") or 0.0)
+        maturity = _parse_iso_date(inv.get("dueDate"))
+        if maturity is None:
+            log.warning("No usable due date for an investment of %s (%.2f EUR) - skipped.", originator, amount)
+            continue
+        if amount <= 0:
+            continue
+        term = None
+        if inv.get("progressStatusDetail") == "DELAYED":
+            missed = _missed_payment_date(inv)
+            if missed is not None:
+                term = overdue_months_and_days(today, missed)
+        if term is None:
+            term = remaining_months_and_days(today, maturity)
+        durations = result.setdefault(originator, {})
+        durations[term] = durations.get(term, 0.0) + amount
+        if rates is not None:
+            base_term = _base_term(inv)
+            if base_term is None:
+                log.warning("No base term found for an investment of %s (%.2f EUR) - excluded from the 'taux' sheet.", originator, amount)
+            rates.add(originator, term, amount, inv.get("interestRatePerYear"), base_term=base_term)
+    return result
 
 
 def compute_amounts(breakdown: dict) -> list:
@@ -1251,14 +1340,14 @@ def run(headless: bool = True) -> None:
                 xirr_backfill_block = {}
 
         # Live-only snapshot (like the geographic repartition): needs the
-        # Playwright session, written to the 'durées prêts' sheet at the end
-        # of run().
+        # Playwright session, aggregated/written at the end of run() ('durée',
+        # 'taux' and 'durées prêts' sheets).
         open_investments = None
         if current_month:
             try:
                 open_investments = fetch_open_investments(page)
             except Exception:
-                log.exception("Failed to fetch the open investments - the 'durées prêts' sheet will not be updated.")
+                log.exception("Failed to fetch the open investments - the 'durée' / 'durées prêts' sheets will not be updated.")
 
         # Persist cookies/local storage so the next run can skip login (and
         # 2FA) while the session remains valid.
@@ -1622,6 +1711,24 @@ def run(headless: bool = True) -> None:
         if uninvested_balance is not None:
             fill_geographic_repartition_uninvested_amount("Swaper", uninvested_balance)
 
+        # Own try/except: the "durée" tab is a secondary view, its failure
+        # must not fail the whole run.
+        if open_investments is not None:
+            try:
+                rates = RateWeights()
+                fill_remaining_duration_amounts(
+                    "Swaper",
+                    aggregate_remaining_durations(open_investments, get_report_now(REPORT_TIMEZONE).date(), rates),
+                    rates=rates,
+                )
+            except Exception:
+                log.exception("Failed to update the 'durée' sheet for Swaper.")
+
+            # Own try/except too: the "taux" tab is independent of the "durée" one.
+            try:
+                fill_rate_amounts("Swaper", rates)
+            except Exception:
+                log.exception("Failed to update the 'taux' sheet for Swaper.")
         if open_investments is not None:
             # "dueDate" is Swaper's maturity: exposed as "maturityDate", the
             # key shared.loan_durations recognises. Rows with nothing

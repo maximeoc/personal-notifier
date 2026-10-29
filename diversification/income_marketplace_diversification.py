@@ -139,6 +139,7 @@ from pathlib import Path
 
 import pyotp
 from dotenv import load_dotenv
+from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
@@ -149,7 +150,10 @@ from shared.google_sheet import (
     fill_current_month_bonus_breakdown,
     fill_geographic_repartition_amounts,
     fill_geographic_repartition_uninvested_amount,
+    fill_remaining_duration_amounts,
 )
+from shared.rate_sheet import fill_rate_amounts
+from shared.remaining_duration import RateWeights, base_term_between, overdue_months_and_days, remaining_months_and_days
 from shared.report_date import get_report_date, is_current_month
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
@@ -164,6 +168,7 @@ LOGIN_PAGE_URL = "https://getincome.com/login"
 API_BASE = "https://api.getincome.com/api"
 INVESTOR_DETAILS_URL = f"{API_BASE}/investor-details"
 ACCOUNT_STATEMENT_URL_TEMPLATE = API_BASE + "/account-statement/{start}/{end}/{page}"
+INVESTMENTS_URL = API_BASE + "/investments/?page_size=1000"
 
 INCOME_MARKETPLACE_EMAIL = os.environ.get("INCOME_MARKETPLACE_EMAIL")
 INCOME_MARKETPLACE_PASSWORD = os.environ.get("INCOME_MARKETPLACE_PASSWORD")
@@ -188,6 +193,8 @@ XIRR_CACHE_OVERLAP_DAYS = 30
 XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "income_marketplace_xirr_cashflows_state.json"
 XIRR_CASHFLOWS_STATE_DEFAULT = {"transactions": [], "last_fetched_date": None}
 STORAGE_STATE_FILE = Path(__file__).parent / "income_marketplace_diversification_storage_state.json"
+FETCH_MAX_ATTEMPTS = 4
+FETCH_RETRY_BASE_DELAY_SECONDS = 3
 
 
 def _reuse_persisted_session(page) -> str | None:
@@ -311,18 +318,31 @@ def _fetch_json(page, url: str, token: str) -> dict:
     """Fetch `url` from inside the already-authenticated page's own JS
     context (never a plain `requests` call - see module docstring for why
     this stays Playwright-based) with the given Bearer token."""
-    result = page.evaluate(
-        """
-        async ({url, token}) => {
-            const r = await fetch(url, {
-                headers: {'Accept': 'application/json', 'Authorization': 'Bearer ' + token}
-            });
-            const body = await r.json();
-            return {status: r.status, body: body};
-        }
-        """,
-        {"url": url, "token": token},
-    )
+    # A browser-level "TypeError: Failed to fetch" is a transient network
+    # failure (no HTTP response at all, e.g. connection reset on a CI runner),
+    # so retry it with a short backoff before giving up.
+    result = None
+    for attempt in range(1, FETCH_MAX_ATTEMPTS + 1):
+        try:
+            result = page.evaluate(
+                """
+                async ({url, token}) => {
+                    const r = await fetch(url, {
+                        headers: {'Accept': 'application/json', 'Authorization': 'Bearer ' + token}
+                    });
+                    const body = await r.json();
+                    return {status: r.status, body: body};
+                }
+                """,
+                {"url": url, "token": token},
+            )
+            break
+        except PlaywrightError as exc:
+            if "Failed to fetch" not in str(exc) or attempt == FETCH_MAX_ATTEMPTS:
+                raise
+            delay = FETCH_RETRY_BASE_DELAY_SECONDS * attempt
+            log.warning("GET %s failed with a network error (attempt %d/%d) - retrying in %ds.", url, attempt, FETCH_MAX_ATTEMPTS, delay)
+            time.sleep(delay)
     if result["status"] != 200:
         raise RuntimeError(f"GET {url} returned HTTP {result['status']}: {result['body']}")
     return result["body"]
@@ -347,6 +367,129 @@ def fetch_investor_details(page, token: str) -> dict:
 
     log.info("Investor details: cash_balance=%.2f EUR, invested_total=%.2f EUR, %d compan(y/ies).", cash_balance, invested_total, len(companies))
     return {"cash_balance": cash_balance, "invested_total": invested_total, "companies": companies}
+
+
+def _base_term(item: dict) -> tuple | None:
+    """Original term of a loan as (months, days): `loan_term_period` (a number of months, verified live 2026-10-26:
+    it always equals `loan_issued_date` -> `loan_due_date`, e.g. 3, 9, 10, 12, 18, 24), else derived from
+    `loan_issued_date` and `loan_due_date`. None if neither is usable."""
+    try:
+        months = int(item.get("loan_term_period"))
+    except (TypeError, ValueError):
+        months = 0
+    if months > 0:
+        return (months, 0)
+    try:
+        return base_term_between(
+            date.fromisoformat(str(item.get("loan_issued_date"))[:10]), date.fromisoformat(str(item.get("loan_due_date"))[:10])
+        )
+    except ValueError:
+        return None
+
+
+def fetch_investments(page, token: str) -> list:
+    """Every investment of the "My investments" page (GET /api/investments/
+    ?page_size=1000, `{"items": [...], "total": N}`, verified live
+    2026-10-16). The `page` query parameter is ignored by the API (page=1 and
+    page=2 return the same 20 rows), so everything is fetched in a single
+    large page; a warning is logged if fewer than `total` rows come back.
+    Returns [{"originator", "outstanding", "maturity", "status",
+    "overdue_since", "rate", "base_term"}] where `rate` is the investor's interest rate in
+    percent (`loan_investor_interest_rate`, e.g. "15.00000" -> 15.0, verified
+    live 2026-10-26), None if missing; `maturity` is the loan's `loan_due_date` (the
+    platform itself shows the remaining term as that date minus today), or
+    None if missing/unparseable; `status` is the raw `loan_status` and
+    `overdue_since` the loan's `overdue_base_date` (None if missing).
+    Verified live 2026-10-16: `loan_status` is "Current" or a lateness
+    bucket "1-15d"/"16-30d"/"31-60d", and `overdue_base_date` is the next
+    scheduled payment date for current loans but the missed payment date for
+    late ones (days since it always fall in the loan's bucket). The platform's
+    i18n also defines "60+d"/"buybackInitiated" ("Buyback initiated": more
+    than 60 days late, buyback obligation triggered), "forcedBuyback" and
+    "paidBack" - never observed on the account, so only inferred. `base_term` is the loan's original term
+    (see _base_term), None if unknown."""
+    data = _fetch_json(page, INVESTMENTS_URL, token)
+    items = data.get("items") or []
+    if len(items) < data.get("total", len(items)):
+        log.warning("Only %d of %s investments returned - remaining-duration amounts are incomplete.", len(items), data.get("total"))
+    investments = []
+    for item in items:
+        try:
+            maturity = date.fromisoformat(str(item.get("loan_due_date"))[:10])
+        except ValueError:
+            maturity = None
+        try:
+            overdue_since = date.fromisoformat(str(item.get("overdue_base_date"))[:10])
+        except ValueError:
+            overdue_since = None
+        try:
+            rate = float(item.get("loan_investor_interest_rate"))
+        except (TypeError, ValueError):
+            rate = None
+        investments.append(
+            {
+                "rate": rate,
+                "base_term": _base_term(item),
+                "originator": (item.get("loan_originator_name") or "Unknown").strip(),
+                "outstanding": float(item.get("investment_outstanding_principal") or 0.0),
+                "maturity": maturity,
+                "status": str(item.get("loan_status") or "").strip(),
+                "overdue_since": overdue_since,
+            }
+        )
+    return investments
+
+
+# Lateness bucket -> minimum days late, only used when overdue_base_date is unusable.
+LATE_BUCKET_MIN_DAYS = {"1-15d": 1, "16-30d": 16, "31-60d": 31}
+# More than 60 days late, buyback obligation triggered - treated as "default" (inferred, never observed live).
+DEFAULT_STATUSES = {"60+d", "buyback initiated", "buybackinitiated"}
+NON_LATE_STATUSES = {"", "current", "paid back", "paidback", "forced buyback", "forcedbuyback"}
+
+
+def _overdue_term(inv: dict, today: date):
+    """Late/default duration key of an investment (see shared.remaining_duration.
+    overdue_months_and_days), or None if it isn't late. Measured from the missed
+    payment date (`overdue_since`); if that isn't in the past, from today minus
+    the minimum days of the loan's lateness bucket."""
+    status = inv.get("status", "").lower()
+    if status in NON_LATE_STATUSES:
+        return None
+    is_default = status in DEFAULT_STATUSES
+    min_days = 61 if is_default else LATE_BUCKET_MIN_DAYS.get(status)
+    if min_days is None:
+        return None
+    return (
+        overdue_months_and_days(today, inv.get("overdue_since") or today, default=is_default)
+        or overdue_months_and_days(today, today - timedelta(days=min_days), default=is_default)
+    )
+
+
+def aggregate_remaining_durations(investments: list, today: date, rates: RateWeights | None = None) -> dict:
+    """Group investments by loan originator (same key as the geographic
+    repartition), then by remaining term as of `today` (months, days):
+    {originator: {(months, days): outstanding}}. Late loans (status "1-15d"/
+    "16-30d"/"31-60d", verified live) use the negated lateness since the missed
+    payment date, "Buyback initiated" (60+ days, inferred) ones the same with a
+    "default" marker (see _overdue_term). Fully repaid investments are ignored;
+    non-late ones without a maturity date are skipped (with a warning)."""
+    result = {}
+    for inv in investments:
+        if inv["outstanding"] <= 0:
+            continue
+        term = _overdue_term(inv, today)
+        if term is None and inv["maturity"] is None:
+            log.warning("No maturity date for an investment of %s (%.2f EUR) - skipped.", inv["originator"], inv["outstanding"])
+            continue
+        if term is None:
+            term = remaining_months_and_days(today, inv["maturity"])
+        durations = result.setdefault(inv["originator"], {})
+        durations[term] = durations.get(term, 0.0) + inv["outstanding"]
+        if rates is not None:
+            if inv.get("base_term") is None:
+                log.warning("No base term found for an investment of %s (%.2f EUR) - excluded from the 'taux' sheet.", inv["originator"], inv["outstanding"])
+            rates.add(inv["originator"], term, inv["outstanding"], inv.get("rate"), base_term=inv.get("base_term"))
+    return result
 
 
 def fetch_account_statement(page, token: str, start_date: date, end_date: date, page_num: int = 0) -> dict:
@@ -496,6 +639,22 @@ def run() -> None:
             overview = fetch_investor_details(page, token)
 
             today_date = get_report_date()
+
+            remaining_durations = None
+            duration_rates = RateWeights()
+            if current_month:
+                # Own try/except: the "durée" tab is a secondary view, its failure must not fail the whole run.
+                try:
+                    remaining_durations = aggregate_remaining_durations(fetch_investments(page, token), today_date, duration_rates)
+                    durations_total = sum(a for terms in remaining_durations.values() for a in terms.values())
+                    if abs(durations_total - overview["invested_total"]) > 0.01:
+                        log.warning(
+                            "Remaining-duration total %.2f EUR differs from the invested total %.2f EUR.",
+                            durations_total, overview["invested_total"],
+                        )
+                except Exception:
+                    log.exception("Failed to fetch the investments' maturity dates for the 'durée' sheet.")
+
             amounts = {
                 "total": overview["invested_total"] + overview["cash_balance"],
                 "gross_interest_received": 0.0,
@@ -714,10 +873,14 @@ def run() -> None:
                         if deposit_dates and total_invested > 0:
                             since_inception_date = min(deposit_dates)
                             avg_idle_cash_lifetime = compute_time_weighted_average(cash_events, since_inception_date, today_date)
-                            cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + total_invested)
-                            lifetime_yield_rate = lifetime_gross_interest / total_invested
+                            # Time-weighted like the idle cash: end-of-period total_invested understates the yield on a fast-growing account.
+                            avg_invested_lifetime = compute_time_weighted_average(invested_events, since_inception_date, today_date)
+                            if avg_invested_lifetime is None or avg_invested_lifetime <= 0:
+                                avg_invested_lifetime = total_invested
+                            cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + avg_invested_lifetime)
+                            lifetime_yield_rate = lifetime_gross_interest / avg_invested_lifetime
                             cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
-                            missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_invested)
+                            missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + avg_invested_lifetime)
 
                             # Waterfall decomposition (switched from
                             # Shapley 2026-09-09, see
@@ -795,6 +958,17 @@ def run() -> None:
     if current_month:
         fill_geographic_repartition_amounts(overview["companies"], platform="Income Marketplace")
         fill_geographic_repartition_uninvested_amount("Income Marketplace", overview["cash_balance"])
+
+        if remaining_durations is not None:
+            try:
+                fill_remaining_duration_amounts("Income Marketplace", remaining_durations, rates=duration_rates)
+            except Exception:
+                log.exception("Failed to update the 'durée' sheet for Income Marketplace.")
+
+            try:
+                fill_rate_amounts("Income Marketplace", duration_rates)
+            except Exception:
+                log.exception("Failed to update the 'taux' sheet for Income Marketplace.")
 
 
 if __name__ == "__main__":

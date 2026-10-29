@@ -273,6 +273,7 @@ import os
 import re
 import sys
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -284,7 +285,10 @@ from shared.google_sheet import (
     fill_current_month_bonus_breakdown,
     fill_geographic_repartition_amounts,
     fill_geographic_repartition_uninvested_amount,
+    fill_remaining_duration_amounts,
 )
+from shared.rate_sheet import fill_rate_amounts
+from shared.remaining_duration import RateWeights, base_term_between, overdue_months_and_days, remaining_months_and_days
 from shared.report_date import get_report_date, is_current_month
 from shared.loan_durations import durations_from_json_items, record_platform_loan_durations
 from shared.state import load_state, save_state
@@ -309,6 +313,12 @@ ACCOUNT_URL = f"https://www.mintos.com/webapp/api/marketplace-api/v1/accounts/{C
 PORTFOLIO_DISTRIBUTIONS_URL = f"https://www.mintos.com/webapp/api/marketplace-api/v1/accounts/{CURRENCY_ID}/portfolio-distributions"
 ACCOUNT_OVERVIEW_URL = f"https://www.mintos.com/webapp/api/marketplace-api/v1/user/overview/currency/{CURRENCY_ID}"
 BONDS_INVESTMENTS_URL = "https://www.mintos.com/webapp/api/bonds-api/v3/investments/current"
+LOAN_INVESTMENTS_URL = "https://www.mintos.com/webapp/api/marketplace-api/v1/user/note-series/investments/current"
+LENDERS_URL = "https://www.mintos.com/webapp/api/marketplace-api/v1/lenders"
+NOTE_SERIES_URL = "https://www.mintos.com/webapp/api/marketplace-api/v1/note-series/{isin}"
+NOTE_SERIES_WORKERS = 6
+LOAN_INVESTMENTS_PAGE_SIZE = 300
+MAX_INVESTMENTS_PAGES = 100
 PLATFORM_LABEL = "Mintos"
 
 # Bond names include a trailing maturity month+year, e.g. "ID Finance Sep
@@ -467,6 +477,187 @@ def fetch_bond_issuer_breakdown(session: requests.Session, duration_items: list 
         if duration_items is not None:
             duration_items.append((item, amount))
     return issuers
+
+
+def _parse_maturity_date(value) -> date | None:
+    """Exact maturity date from an API value: epoch milliseconds/seconds,
+    ISO "YYYY-MM-DD[...]" or "dd.mm.yyyy". None if unusable."""
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value / 1000 if value > 1e11 else value).date()
+    if isinstance(value, str):
+        match = re.match(r"(\d{4})-(\d{2})-(\d{2})", value.strip())
+        if match:
+            return date(*(int(g) for g in match.groups()))
+        match = re.match(r"(\d{2})\.(\d{2})\.(\d{4})", value.strip())
+        if match:
+            day, month, year = (int(g) for g in match.groups())
+            return date(year, month, day)
+    return None
+
+
+def _money(value) -> float:
+    if isinstance(value, dict):
+        value = value.get("amount")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _percent(value):
+    """Annual rate in percent from an API value (number or numeric string), None if absent/unreadable."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _loan_originator_names_by_company(session: requests.Session) -> dict:
+    """{lenderCompanyId: originator name as shown by the portfolio
+    distribution}. An investment only carries its lender company id (and a
+    per-product `lenderName`, e.g. "Evergreen (discount)"), while
+    portfolio-distributions groups by lender *group id* under the group's
+    name ("Evergreen Finance"); `GET .../v1/lenders` links company -> group."""
+    r = session.get(PORTFOLIO_DISTRIBUTIONS_URL, timeout=20)
+    _check_authenticated(r)
+    distribution = ((r.json() or {}).get("loanOriginators") or {}).get("distribution") or []
+    group_names = {str(item.get("id")): item.get("name") for item in distribution}
+    r = session.get(LENDERS_URL, timeout=20)
+    _check_authenticated(r)
+    if not r.ok:
+        raise RuntimeError(f"Lenders endpoint returned status {r.status_code}")
+    return {
+        str(lender.get("id")): group_names.get(str(lender.get("groupId")))
+        for lender in (r.json() or {}).get("items") or []
+    }
+
+
+def fetch_loan_investments(session: requests.Session) -> list:
+    """Every current loan investment in bulk (verified live 2026-10-16):
+    `POST /webapp/api/marketplace-api/v1/user/note-series/investments/current`
+    (needs the `Anti-Csrf-Token` header, see get_csrf_token()), paginated
+    300 at a time via `pagination.hasNextPage`. Each item has the exact
+    `maturityDate` and `investedAmount` (outstanding principal, same basis
+    as the geo sheet's portfolio-distributions totals).
+    Returns [{"originator", "amount", "maturity"}] with the originator named
+    as in fetch_loan_originator_breakdown() (falls back to `lenderName`)."""
+    headers = {"Anti-Csrf-Token": get_csrf_token(session)}
+    names = _loan_originator_names_by_company(session)
+    investments = []
+    for page in range(1, MAX_INVESTMENTS_PAGES + 1):
+        body = {
+            "currency": CURRENCY_ID,
+            "pagination": {"maxResults": LOAN_INVESTMENTS_PAGE_SIZE, "page": page},
+            "sorting": {"sortField": "maturityDate", "sortOrder": "ASC"},
+        }
+        r = session.post(LOAN_INVESTMENTS_URL, json=body, headers=headers, timeout=30)
+        _check_authenticated(r)
+        if not r.ok:
+            raise RuntimeError(f"Loan investments endpoint returned status {r.status_code}")
+        data = r.json() or {}
+        for item in data.get("items") or []:
+            investments.append(
+                {
+                    "originator": names.get(str(item.get("lenderCompanyId"))) or item.get("lenderName"),
+                    "amount": _money(item.get("investedAmount")),
+                    "maturity": _parse_maturity_date(item.get("maturityDate")),
+                    "pending": _money(item.get("pendingPaymentAmount")) > 0,
+                    "in_recovery": _money(item.get("inRecoveryAmount")) > 0,
+                    "next_payment": _parse_maturity_date(item.get("nextPaymentDate")),
+                    "rate": _percent(item.get("interestRate")),
+                    "isin": item.get("isin"),
+                }
+            )
+        if not (data.get("pagination") or {}).get("hasNextPage"):
+            break
+    return investments
+
+
+def fetch_bond_investments(session: requests.Session) -> list:
+    """Every current bond investment (same endpoint as
+    fetch_bond_issuer_breakdown()), same output shape as
+    fetch_loan_investments(); the exact date is the item's `maturityDate`."""
+    params = {"sorting[field]": "maturityDate", "sorting[order]": "asc", "pagination[limit]": "100"}
+    r = session.get(BONDS_INVESTMENTS_URL, params=params, timeout=20)
+    _check_authenticated(r)
+    if not r.ok:
+        raise RuntimeError(f"Bonds investments endpoint returned status {r.status_code}")
+    return [
+        {
+            "originator": _BOND_NAME_DATE_SUFFIX.sub("", item.get("bondName") or "").strip(),
+            "amount": _money(item.get("investedAmount")),
+            "maturity": _parse_maturity_date(item.get("maturityDate")),
+            "rate": _percent(item.get("bondTotalInterestRate")),
+            "isin": next((s.get("isin") for s in item.get("noteSeriesInvestments") or [] if s.get("isin")), None),
+        }
+        for item in (r.json() or {}).get("items") or []
+    ]
+
+
+def _fetch_note_series_base_term(session: requests.Session, isin: str):
+    """(months, days) from the note series' listing date (`noteListedAt`) to its
+    initial maturity (`initialMaturityDate`), None if unavailable (verified
+    live 2026-10-26 on `GET /v1/note-series/{isin}` for loans and bonds)."""
+    r = session.get(NOTE_SERIES_URL.format(isin=isin), timeout=20)
+    _check_authenticated(r)
+    if not r.ok:
+        raise RuntimeError(f"Note series endpoint returned status {r.status_code}")
+    data = r.json() or {}
+    return base_term_between(
+        _parse_maturity_date(data.get("noteListedAt")),
+        _parse_maturity_date(data.get("initialMaturityDate") or data.get("maturityDate")),
+    )
+
+
+def fetch_note_series_base_terms(session: requests.Session, investments: list) -> dict:
+    """{isin: (months, days)} for the distinct ISINs of `investments`; an ISIN
+    whose lookup fails is left out (warning)."""
+    isins = sorted({inv["isin"] for inv in investments if inv.get("isin")})
+
+    def lookup(isin):
+        try:
+            return isin, _fetch_note_series_base_term(session, isin)
+        except Exception as exc:
+            log.warning("Base term lookup failed for %s: %s", isin, exc)
+            return isin, None
+
+    with ThreadPoolExecutor(max_workers=NOTE_SERIES_WORKERS) as pool:
+        return {isin: term for isin, term in pool.map(lookup, isins) if term is not None}
+
+
+def aggregate_remaining_durations(
+    investments: list, today: date, rates: RateWeights | None = None, base_terms: dict | None = None
+) -> dict:
+    """Group investments (loans + bonds, merged by issuer name like the geo
+    sheet) by remaining term as of `today` (months, days):
+    {originator: {(months, days): amount}}. Investments without a usable
+    originator or maturity date are skipped (with a warning). `rates`
+    (optional) collects each note's interest rate (%) for the "durée" sheet.
+
+    The only late/default signals Mintos gives per note are
+    `pendingPaymentAmount` (> 0: a payment is late) and `inRecoveryAmount`
+    (> 0: in recovery, treated as default); such a note is grouped by how
+    long ago its `nextPaymentDate` was due instead, when that date is in the
+    past (otherwise it keeps its remaining term)."""
+    result = {}
+    for inv in investments:
+        originator = inv.get("originator")
+        if not originator or inv.get("maturity") is None:
+            log.warning("Missing originator/maturity for an investment of %s (%.2f EUR) - skipped.", originator, inv.get("amount", 0.0))
+            continue
+        term = None
+        if (inv.get("pending") or inv.get("in_recovery")) and inv.get("next_payment"):
+            term = overdue_months_and_days(today, inv["next_payment"], default=bool(inv.get("in_recovery")))
+        if term is None:
+            term = remaining_months_and_days(today, inv["maturity"])
+        durations = result.setdefault(originator, {})
+        durations[term] = durations.get(term, 0.0) + inv["amount"]
+        if rates is not None:
+            base_term = (base_terms or {}).get(inv.get("isin"))
+            if base_term is None:
+                log.warning("No base term for %s (%s, %.2f EUR).", originator, inv.get("isin"), inv["amount"])
+            rates.add(originator, term, inv["amount"], inv.get("rate"), base_term=base_term)
+    return result
 
 
 def get_csrf_token(session: requests.Session) -> str:
@@ -1050,10 +1241,14 @@ def compute_xirr_block_as_of(session: requests.Session, all_entries: list, end_d
         return result
 
     avg_idle_cash_lifetime = compute_average_idle_cash(all_entries, since_inception_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
-    cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + outstanding_as_of)
-    lifetime_yield_rate = lifetime_statement_totals["gross_interest_received"] / outstanding_as_of
+    # Time-weighted like the idle cash: end-of-period balance understates the yield on a fast-growing account.
+    avg_invested_lifetime = compute_average_balances(all_entries, since_inception_date, end_date)[0]
+    if avg_invested_lifetime is None or avg_invested_lifetime <= 0:
+        avg_invested_lifetime = outstanding_as_of
+    cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + avg_invested_lifetime)
+    lifetime_yield_rate = lifetime_statement_totals["gross_interest_received"] / avg_invested_lifetime
     cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
-    missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + outstanding_as_of)
+    missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + avg_invested_lifetime)
 
     lifetime_withholding_tax = lifetime_statement_totals["withholding_tax"]
     lifetime_gross_interest = lifetime_statement_totals["gross_interest_received"]
@@ -1338,7 +1533,11 @@ def run(session: requests.Session | None = None) -> None:
 
         if xirr_value is not None and signed_cashflows is not None and since_inception_date is not None and total_outstanding > 0:
             avg_idle_cash_lifetime = compute_average_idle_cash(all_entries, since_inception_date.strftime("%Y-%m-%d"), today_str)
-            cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + total_outstanding)
+            # Time-weighted like the idle cash: end-of-period balance understates the yield on a fast-growing account.
+            avg_invested_lifetime = compute_average_balances(all_entries, since_inception_date, today_date)[0]
+            if avg_invested_lifetime is None or avg_invested_lifetime <= 0:
+                avg_invested_lifetime = total_outstanding
+            cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + avg_invested_lifetime)
             try:
                 lifetime_statement_totals = fetch_statement_totals(session, since_inception_date, today_date)
             except Exception:
@@ -1346,9 +1545,9 @@ def run(session: requests.Session | None = None) -> None:
                 lifetime_statement_totals = None
 
             if lifetime_statement_totals is not None:
-                lifetime_yield_rate = lifetime_statement_totals["gross_interest_received"] / total_outstanding
+                lifetime_yield_rate = lifetime_statement_totals["gross_interest_received"] / avg_invested_lifetime
                 cash_drag_lifetime_total = cash_weight_lifetime * lifetime_yield_rate
-                missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + total_outstanding)
+                missed_earnings = cash_drag_lifetime_total * (avg_idle_cash_lifetime + avg_invested_lifetime)
                 lifetime_withholding_tax = lifetime_statement_totals["withholding_tax"]
                 lifetime_gross_interest = lifetime_statement_totals["gross_interest_received"]
 
@@ -1483,6 +1682,25 @@ def run(session: requests.Session | None = None) -> None:
         record_platform_loan_durations(
             PLATFORM_LABEL, "Crowdlending", lambda: durations_from_json_items(duration_items),
         )
+
+        # Own try/except: the "durée" tab is a secondary view, its failure
+        # must not fail the whole run.
+        rates = RateWeights()
+        try:
+            investments = fetch_loan_investments(session) + fetch_bond_investments(session)
+            base_terms = fetch_note_series_base_terms(session, investments)
+            fill_remaining_duration_amounts(
+                "Mintos",
+                aggregate_remaining_durations(investments, today_date, rates, base_terms),
+                rates=rates,
+            )
+        except Exception:
+            log.exception("Failed to update the 'durée' sheet for Mintos.")
+        else:
+            try:
+                fill_rate_amounts("Mintos", rates)
+            except Exception:
+                log.exception("Failed to update the 'taux' sheet for Mintos.")
 
 
 if __name__ == "__main__":

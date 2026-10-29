@@ -33,3 +33,5 @@ swaper_diversification_storage_state.json
 # Trade Republic scraper secrets/exports
 trade_republic_scraper/config.ini
 trade_republic_scraper/out/
+
+to_ignore
