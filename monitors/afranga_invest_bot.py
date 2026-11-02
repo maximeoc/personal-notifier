@@ -34,9 +34,10 @@ MODE (env AFRANGA_BOT_MODE, default "probe"):
 
 Required env vars: AFRANGA_EMAIL, AFRANGA_PASSWORD, AFRANGA_TOTP_SECRET (if 2FA),
 GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS, SMTP_* / EMAIL_TO.
-Optional: CRON_JOB_API_KEY, AFRANGA_CRON_JOB_ID -> cron-job.org schedule every 2 min
-(balance >= minimum) / once a day (below), cached in a local state file so the API
-is only called when the mode changes (see shared/cron_schedule.py).
+Optional: CRON_JOB_API_KEY, AFRANGA_CRON_JOB_ID -> cron-job.org schedule: the "Temps
+planification solde suffisant / insuffisant" columns of the Afranga row in "config robots"
+(defaults: every 2 min when the balance >= minimum, once a day below), cached in a local
+state file so the API is only called when the interval changes (see shared/cron_schedule.py).
 """
 
 import json
@@ -56,11 +57,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from diversification.afranga_diversification import _HEADERS, fetch_uninvested_balance, login
-from shared.cron_schedule import apply_startup_jitter, ensure_schedule
+from shared.cron_schedule import DAY_MINUTES, apply_startup_jitter, ensure_schedule_interval
 from shared.google_sheet import get_geo_platform_snapshot
 from shared.missing_loans import TRANSIENT_GRACE_SECONDS, report_missing_loans
 from shared.notifier import send_afranga_invest_summary_email
-from shared.robot_config import Candidate, build_tracker, get_platform_config, plan_allocations
+from shared.robot_config import Candidate, begin_run, build_tracker, get_platform_config, plan_allocations
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
 
@@ -110,13 +111,17 @@ def _log_diagnostics(tag: str, **fields) -> None:
         log.exception("Could not write to %s", DIAGNOSTICS_FILE)
 
 
-def _collect_run_diagnostics(since: datetime) -> str | None:
+def _collect_run_diagnostics(since: datetime, tags: set[str] | None = None) -> str | None:
     if not DIAGNOSTICS_FILE.exists():
         return None
     lines = []
     for line in DIAGNOSTICS_FILE.read_text(encoding="utf-8").splitlines():
         try:
-            if datetime.fromisoformat(json.loads(line)["timestamp"]) >= since:
+            entry = json.loads(line)
+            if (
+                datetime.fromisoformat(entry["timestamp"]) >= since
+                and (tags is None or entry.get("tag") in tags)
+            ):
                 lines.append(line)
         except (json.JSONDecodeError, KeyError, ValueError):
             continue
@@ -275,6 +280,7 @@ def plan_primary(rows: list, tracker, budget: float) -> list:
 
 
 def _add_to_cart(session: requests.Session, csrf: str, urls: dict, line: Line) -> tuple:
+    """Returns `(ok, body, failure_reason)`."""
     if line.market == "secondary":
         row = line.row
         payload = {
@@ -292,7 +298,8 @@ def _add_to_cart(session: requests.Session, csrf: str, urls: dict, line: Line) -
     ok = r.ok and isinstance(body, dict) and body.get("success") is not False
     _log_diagnostics("add_to_cart", market=line.market, payload=payload, status=r.status_code, ok=ok,
                      response=_redact(r.text[:5000]))
-    return ok, body
+    reason = None if ok else f"ajout au panier refusé (HTTP {r.status_code}) : {' '.join(_redact(r.text[:300]).split())}"
+    return ok, body, reason
 
 
 def _capture_review_page(session: requests.Session, review_url: str, market: str) -> str:
@@ -401,12 +408,13 @@ def execute_market(session: requests.Session, market: MarketRows, lines: list, t
     review_url = market.config.get("order", {}).get("review_url")
     for line in to_add:
         stats["attempts"] += 1
-        ok, body = _add_to_cart(session, csrf, urls, line)
+        ok, body, reason = _add_to_cart(session, csrf, urls, line)
         if ok:
             added.append((line, _find_key((body or {}).get("line", body), "cart_loan_id")))
             review_url = _find_key(body, "review_url") or review_url
         else:
             stats["failures"] += 1
+            stats["failed_attempts"].append({"label": f"[{line.market}] {line.loan_name}", "amount": line.amount, "reason": reason})
     if not added:
         return
 
@@ -437,14 +445,24 @@ def execute_market(session: requests.Session, market: MarketRows, lines: list, t
             )
     else:
         stats["failures"] += len(added)
+        for line, _id in added:
+            stats["failed_attempts"].append({
+                "label": f"[{line.market}] {line.loan_name}", "amount": line.amount,
+                "reason": "confirmation du panier refusée (voir diagnostics 'confirm_*')",
+            })
 
 
 def run() -> None:
+    # Before the startup wait: schedule check against the sheet + stop if no market is active.
+    disabled, wait_range = begin_run("Afranga", AFRANGA_CRON_JOB_ID, CRON_SCHEDULE_STATE_FILE, 2, DAY_MINUTES)
+    if disabled:
+        return
+
     run_started_at = datetime.now(timezone.utc)
-    apply_startup_jitter(CRON_SCHEDULE_STATE_FILE)
+    apply_startup_jitter(CRON_SCHEDULE_STATE_FILE, wait_range)
     stats = {
         "mode": MODE, "attempts": 0, "successes": 0, "failures": 0, "total_invested": 0.0,
-        "invested": [], "plan": [], "probed": False,
+        "invested": [], "plan": [], "probed": False, "failed_attempts": [],
     }
     error = None
     config = None
@@ -459,16 +477,26 @@ def run() -> None:
         # login() returns None, so the balance is fetched by fetch_fn on the fresh session.
         stats["balance_before"] = stats["balance_after"] = balance
         log.info("Afranga mode=%s, uninvested balance: %.2f EUR", MODE, balance)
-        # Before any early return, so the schedule always follows the balance.
-        ensure_schedule(
-            "24h" if balance < MIN_INVESTMENT_AMOUNT else "2m",
-            cron_job_id=AFRANGA_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE,
+        # Read before any early return, so the schedule always follows the
+        # balance; a read failure only matters once the balance is sufficient.
+        config_error = None
+        try:
+            config = get_platform_config("Afranga")
+        except Exception as exc:
+            config_error = exc
+            log.exception("Could not read the Afranga configuration from the 'config robots' sheet.")
+        sufficient = balance >= MIN_INVESTMENT_AMOUNT
+        default_minutes = 2 if sufficient else DAY_MINUTES
+        ensure_schedule_interval(
+            config.schedule_minutes(sufficient, default_minutes) if config else default_minutes,
+            cron_job_id=AFRANGA_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE, sufficient=sufficient,
         )
-        if balance < MIN_INVESTMENT_AMOUNT:
+        if not sufficient:
             log.info("Balance below the minimum investment amount - nothing to do.")
             return
 
-        config = get_platform_config("Afranga")
+        if config is None:
+            raise config_error
         if not config.active_names() and not config.secondary_names():
             log.info("No Afranga loan is active (primary or secondary) in the config sheet.")
             return
@@ -527,11 +555,15 @@ def run() -> None:
     finally:
         _log_diagnostics("run_summary", stats=stats, error=error)
         had_problem = bool(error or stats["failures"])
-        # Email only on error or when a real purchase was attempted (dry/probe never buy);
-        # diagnostics are attached only when something went wrong.
+        # Successful runs attach only the cart/confirmation exchanges; failures
+        # retain the full run diagnostics for troubleshooting.
         if error or (MODE == "live" and stats["attempts"]):
+            diagnostic_tags = None if had_problem else {
+                "add_to_cart", "confirm_primary", "confirm_secondary",
+            }
             send_afranga_invest_summary_email(
-                stats, error=error, diagnostics_text=_collect_run_diagnostics(run_started_at) if had_problem else None,
+                stats, error=error,
+                diagnostics_text=_collect_run_diagnostics(run_started_at, tags=diagnostic_tags),
                 robot_config=config,
             )
     if error:

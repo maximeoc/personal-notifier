@@ -153,7 +153,14 @@ from shared.google_sheet import (
     fill_remaining_duration_amounts,
 )
 from shared.rate_sheet import fill_rate_amounts
-from shared.remaining_duration import RateWeights, base_term_between, overdue_months_and_days, remaining_months_and_days
+from shared.remaining_duration import (
+    BUYBACK_GRACE_DAYS,
+    DEFAULT_AFTER_LATE_DAYS,
+    RateWeights,
+    base_term_between,
+    overdue_months_and_days,
+    remaining_months_and_days,
+)
 from shared.report_date import get_report_date, is_current_month
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
@@ -193,6 +200,9 @@ XIRR_CACHE_OVERLAP_DAYS = 30
 XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "income_marketplace_xirr_cashflows_state.json"
 XIRR_CASHFLOWS_STATE_DEFAULT = {"transactions": [], "last_fetched_date": None}
 STORAGE_STATE_FILE = Path(__file__).parent / "income_marketplace_diversification_storage_state.json"
+LOGIN_SUBMIT_MAX_ATTEMPTS = 3
+LOGIN_RESPONSE_TIMEOUT_MS = 60000
+LOGIN_RETRY_DELAY_SECONDS = 10
 FETCH_MAX_ATTEMPTS = 4
 FETCH_RETRY_BASE_DELAY_SECONDS = 3
 
@@ -224,6 +234,38 @@ def _reuse_persisted_session(page) -> str | None:
     return token if status == 200 else None
 
 
+def _submit_credentials(page):
+    """Fill + submit the login form and return the auth0-login response.
+    On a CI runner the POST sometimes never gets any response within the
+    timeout (slow/throttled first hit), so reload the login page and retry
+    a couple of times, logging failed requests / page text for diagnosis."""
+    failed_requests: list[str] = []
+    page.on("requestfailed", lambda r: failed_requests.append(f"{r.method} {r.url} -> {r.failure}"))
+    last_exc: PlaywrightTimeoutError | None = None
+    for attempt in range(1, LOGIN_SUBMIT_MAX_ATTEMPTS + 1):
+        log.info("Submitting credentials (attempt %d/%d)...", attempt, LOGIN_SUBMIT_MAX_ATTEMPTS)
+        page.fill("#input-username", INCOME_MARKETPLACE_EMAIL)
+        page.fill("#input-password", INCOME_MARKETPLACE_PASSWORD)
+        try:
+            with page.expect_response(lambda r: r.url.endswith("/api/auth0-login"), timeout=LOGIN_RESPONSE_TIMEOUT_MS) as resp_info:
+                page.click("button[type='submit']")
+            return resp_info.value
+        except PlaywrightTimeoutError as exc:
+            last_exc = exc
+            try:
+                page_text = " ".join(page.inner_text("body").split())[:300]
+            except Exception:
+                page_text = "<unavailable>"
+            log.warning(
+                "No auth0-login response within %ds (attempt %d/%d). Failed requests: %s. Page text: %s",
+                LOGIN_RESPONSE_TIMEOUT_MS // 1000, attempt, LOGIN_SUBMIT_MAX_ATTEMPTS, failed_requests[-5:], page_text,
+            )
+            if attempt < LOGIN_SUBMIT_MAX_ATTEMPTS:
+                time.sleep(LOGIN_RETRY_DELAY_SECONDS * attempt)
+                page.goto(LOGIN_PAGE_URL, wait_until="networkidle", timeout=30000)
+    raise last_exc
+
+
 def login(page) -> str:
     """Log in to Income Marketplace using INCOME_MARKETPLACE_EMAIL/PASSWORD
     + INCOME_MARKETPLACE_TOTP_SECRET (2FA is always enabled on the
@@ -247,13 +289,8 @@ def login(page) -> str:
     if not INCOME_MARKETPLACE_EMAIL or not INCOME_MARKETPLACE_PASSWORD:
         raise RuntimeError("INCOME_MARKETPLACE_EMAIL and INCOME_MARKETPLACE_PASSWORD environment variables are required.")
 
-    log.info("Submitting credentials...")
-    page.fill("#input-username", INCOME_MARKETPLACE_EMAIL)
-    page.fill("#input-password", INCOME_MARKETPLACE_PASSWORD)
-
-    with page.expect_response(lambda r: r.url.endswith("/api/auth0-login")) as resp_info:
-        page.click("button[type='submit']")
-    login_data = resp_info.value.json()
+    resp = _submit_credentials(page)
+    login_data = resp.json()
 
     if not login_data.get("mfa_required"):
         # Not observed live (2FA always enabled on the test account), kept
@@ -277,7 +314,7 @@ def login(page) -> str:
     # Diagnostic only (no secret/code values logged): compare the server's
     # Date response header to our local clock - same precaution as every
     # other TOTP-gated platform in this repo.
-    server_date_header = resp_info.value.headers.get("date")
+    server_date_header = resp.headers.get("date")
     if server_date_header:
         try:
             server_time = parsedate_to_datetime(server_date_header)
@@ -405,8 +442,9 @@ def fetch_investments(page, token: str) -> list:
     scheduled payment date for current loans but the missed payment date for
     late ones (days since it always fall in the loan's bucket). The platform's
     i18n also defines "60+d"/"buybackInitiated" ("Buyback initiated": more
-    than 60 days late, buyback obligation triggered), "forcedBuyback" and
-    "paidBack" - never observed on the account, so only inferred. `base_term` is the loan's original term
+    than 60 days late, buyback obligation triggered; observed live 2026-10-31),
+    "forcedBuyback" and "paidBack" - never observed on the account, so only
+    inferred. `buyback_guarantee` is `loan_buyback_guarantee == 1`. `base_term` is the loan's original term
     (see _base_term), None if unknown."""
     data = _fetch_json(page, INVESTMENTS_URL, token)
     items = data.get("items") or []
@@ -435,6 +473,7 @@ def fetch_investments(page, token: str) -> list:
                 "maturity": maturity,
                 "status": str(item.get("loan_status") or "").strip(),
                 "overdue_since": overdue_since,
+                "buyback_guarantee": item.get("loan_buyback_guarantee") == 1,
             }
         )
     return investments
@@ -442,25 +481,40 @@ def fetch_investments(page, token: str) -> list:
 
 # Lateness bucket -> minimum days late, only used when overdue_base_date is unusable.
 LATE_BUCKET_MIN_DAYS = {"1-15d": 1, "16-30d": 16, "31-60d": 31}
-# More than 60 days late, buyback obligation triggered - treated as "default" (inferred, never observed live).
+# More than 60 days late. "Buyback initiated" was observed live 2026-10-31 (loan_is_active 0, nothing received yet,
+# loan_buyback_guarantee 1): the originator owes the buyback, so it is only a loss ("default") if the loan has no buyback guarantee.
 DEFAULT_STATUSES = {"60+d", "buyback initiated", "buybackinitiated"}
 NON_LATE_STATUSES = {"", "current", "paid back", "paidback", "forced buyback", "forcedbuyback"}
+# A guaranteed loan still "Buyback initiated" after shared.remaining_duration.DEFAULT_AFTER_LATE_DAYS of lateness is
+# counted as a default (buyback not honored); the platform exposes no "buyback failed" status.
 
 
 def _overdue_term(inv: dict, today: date):
     """Late/default duration key of an investment (see shared.remaining_duration.
     overdue_months_and_days), or None if it isn't late. Measured from the missed
     payment date (`overdue_since`); if that isn't in the past, from today minus
-    the minimum days of the loan's lateness bucket."""
+    the minimum days of the loan's lateness bucket. A status the platform
+    doesn't document here is counted as a default (and logged) rather than
+    silently as a healthy loan."""
     status = inv.get("status", "").lower()
     if status in NON_LATE_STATUSES:
         return None
-    is_default = status in DEFAULT_STATUSES
-    min_days = 61 if is_default else LATE_BUCKET_MIN_DAYS.get(status)
-    if min_days is None:
-        return None
+    beyond_60_days = status in DEFAULT_STATUSES
+    if status not in LATE_BUCKET_MIN_DAYS and not beyond_60_days:
+        log.warning("Unknown Income Marketplace loan status %r (%s, %.2f EUR) - counted as a default.", inv.get("status"), inv.get("originator"), inv.get("outstanding", 0.0))
+        beyond_60_days, is_default = True, True
+    else:
+        is_default = beyond_60_days and not inv.get("buyback_guarantee", False)
+    overdue_since = inv.get("overdue_since")
+    if beyond_60_days and not is_default:
+        late_days = (today - overdue_since).days if overdue_since else 61
+        log.warning("%s (%.2f EUR): %s, %d days late - buyback guaranteed but not paid yet.", inv.get("originator"), inv.get("outstanding", 0.0), inv.get("status"), late_days)
+        if late_days > DEFAULT_AFTER_LATE_DAYS:
+            log.warning("Buyback still unpaid after %d days of grace - counted as a default.", BUYBACK_GRACE_DAYS)
+            is_default = True
+    min_days = 61 if beyond_60_days else LATE_BUCKET_MIN_DAYS.get(status)
     return (
-        overdue_months_and_days(today, inv.get("overdue_since") or today, default=is_default)
+        overdue_months_and_days(today, overdue_since or today, default=is_default)
         or overdue_months_and_days(today, today - timedelta(days=min_days), default=is_default)
     )
 
@@ -470,8 +524,9 @@ def aggregate_remaining_durations(investments: list, today: date, rates: RateWei
     repartition), then by remaining term as of `today` (months, days):
     {originator: {(months, days): outstanding}}. Late loans (status "1-15d"/
     "16-30d"/"31-60d", verified live) use the negated lateness since the missed
-    payment date, "Buyback initiated" (60+ days, inferred) ones the same with a
-    "default" marker (see _overdue_term). Fully repaid investments are ignored;
+    payment date; "Buyback initiated" (60+ days, verified live 2026-10-31) ones
+    too while the loan has a buyback guarantee, otherwise with a "default"
+    marker (see _overdue_term). Fully repaid investments are ignored;
     non-late ones without a maturity date are skipped (with a warning)."""
     result = {}
     for inv in investments:
