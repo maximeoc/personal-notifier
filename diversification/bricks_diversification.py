@@ -375,8 +375,10 @@ def fetch_current_month_revenue_totals(session: requests.Session) -> dict:
     untaxedTotal = obligationCoupons.untaxedTotal + referrals.total +
     boostedBalanceGain.total holds and obligationCoupons alone can safely
     be used as the "real" gross/net interest going forward).
-    `withholding_tax` = obligationCoupons gross - net (interest-only tax,
-    referrals/boosted-balance gains being untaxed have none to subtract).
+    `withholding_tax` = obligationCoupons untaxedTotal - taxedTotal
+    (interest-only tax, referrals/boosted-balance gains being untaxed have
+    none to subtract). Since 2026-11-12 (user's choice), gross = coupons +
+    withholding_tax and net = coupons - see the comment in the body.
     """
     month_str = get_report_now(REPORT_TIMEZONE).strftime("%Y-%m")
     log.info("Requesting Bricks revenue endpoint for %s...", month_str)
@@ -396,17 +398,26 @@ def fetch_current_month_revenue_totals(session: requests.Session) -> dict:
     log.info("Raw revenuesTotal for %s: %r", month_str, revenues_total)
 
     try:
-        gross_interest_received = round(float(obligation_coupons.get("untaxedTotal") or 0) / 100, 2)
+        coupons_untaxed = round(float(obligation_coupons.get("untaxedTotal") or 0) / 100, 2)
     except (TypeError, ValueError):
         log.warning("Could not parse obligationCoupons 'untaxedTotal' %r - defaulting to 0.0.", obligation_coupons.get("untaxedTotal"))
-        gross_interest_received = 0.0
+        coupons_untaxed = 0.0
     try:
-        net_interest_received = round(float(obligation_coupons.get("taxedTotal") or 0) / 100, 2)
+        coupons_taxed = round(float(obligation_coupons.get("taxedTotal") or 0) / 100, 2)
     except (TypeError, ValueError):
         log.warning("Could not parse obligationCoupons 'taxedTotal' %r - defaulting to 0.0.", obligation_coupons.get("taxedTotal"))
-        net_interest_received = 0.0
+        coupons_taxed = 0.0
 
-    withholding_tax = round(gross_interest_received - net_interest_received, 2)
+    # Modèle choisi par l'utilisateur (2026-11-12) : les coupons affichés par
+    # Bricks ("revenus reversés", untaxedTotal) sont considérés comme le NET,
+    # la "Fiscalité" (prélèvement à la source 31,4 %, untaxedTotal - taxedTotal)
+    # s'y AJOUTE pour former le brut. Ex. novembre 2026 : coupons 22,94 +
+    # fiscalité 5,40 = brut 28,34 ; net = 22,94 ; rien de plus à payer, donc
+    # "intérêts net après impots" = net dans la feuille. La ligne "intérêts
+    # net" de la feuille est une formule brut - prélèvements, d'où net = coupons.
+    withholding_tax = round(coupons_untaxed - coupons_taxed, 2)
+    gross_interest_received = round(coupons_untaxed + withholding_tax, 2)
+    net_interest_received = coupons_untaxed
 
     try:
         referrals_total = float((revenues_detail.get("referrals") or {}).get("total") or 0) / 100
