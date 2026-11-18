@@ -84,9 +84,10 @@ Data endpoints (all under api.getincome.com, `Authorization: Bearer` auth):
       1 returns a PDF blob (`%PDF-1.4...`) instead of a JSON "empty next
       page", crashing a naive fetch/JSON-parse. Since this account is
       small (a handful of dozens of rows per category over its whole
-      lifetime, confirmed live), this module only ever requests page 0 -
-      see `fetch_all_statement_transactions()`'s own docstring for the
-      (best-effort, not foolproof) large-row-count warning tripwire.
+      lifetime, confirmed live), page 0 only is requested; a category
+      reaching a possible page-size limit makes the date range get split
+      into smaller ranges instead - see
+      `fetch_all_statement_transactions()`'s own docstring.
       IMPORTANT GOTCHA (same class of bug as Afranga's/Debitum's own
       documented lesson): the same `transaction_id` is reused across
       MULTIPLE distinct rows for one real underlying event (e.g. a single
@@ -151,17 +152,18 @@ from shared.google_sheet import (
     fill_geographic_repartition_amounts,
     fill_geographic_repartition_uninvested_amount,
     fill_remaining_duration_amounts,
+    default_after_late_days,
 )
 from shared.rate_sheet import fill_rate_amounts
 from shared.remaining_duration import (
     BUYBACK_GRACE_DAYS,
-    DEFAULT_AFTER_LATE_DAYS,
     RateWeights,
     base_term_between,
     overdue_months_and_days,
     remaining_months_and_days,
 )
 from shared.report_date import get_report_date, is_current_month
+from shared.retry import retry_call
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
 from shared.monthly_yield_waterfall import compute_monthly_yield_shares
@@ -175,7 +177,10 @@ LOGIN_PAGE_URL = "https://getincome.com/login"
 API_BASE = "https://api.getincome.com/api"
 INVESTOR_DETAILS_URL = f"{API_BASE}/investor-details"
 ACCOUNT_STATEMENT_URL_TEMPLATE = API_BASE + "/account-statement/{start}/{end}/{page}"
-INVESTMENTS_URL = API_BASE + "/investments/?page_size=1000"
+INVESTMENTS_URL = API_BASE + "/investments/"
+INVESTMENTS_DEFAULT_PAGE_SIZE = 1000
+# A statement category returning this many rows may be cut by a page-size limit - see fetch_all_statement_transactions().
+STATEMENT_ROW_COUNT_SPLIT_THRESHOLD = 200
 
 INCOME_MARKETPLACE_EMAIL = os.environ.get("INCOME_MARKETPLACE_EMAIL")
 INCOME_MARKETPLACE_PASSWORD = os.environ.get("INCOME_MARKETPLACE_PASSWORD")
@@ -429,7 +434,8 @@ def fetch_investments(page, token: str) -> list:
     ?page_size=1000, `{"items": [...], "total": N}`, verified live
     2026-10-16). The `page` query parameter is ignored by the API (page=1 and
     page=2 return the same 20 rows), so everything is fetched in a single
-    large page; a warning is logged if fewer than `total` rows come back.
+    page: if fewer than `total` rows come back, it is requested again with
+    page_size=total, and a `RuntimeError` is raised if rows are still missing.
     Returns [{"originator", "outstanding", "maturity", "status",
     "overdue_since", "rate", "base_term"}] where `rate` is the investor's interest rate in
     percent (`loan_investor_interest_rate`, e.g. "15.00000" -> 15.0, verified
@@ -446,10 +452,16 @@ def fetch_investments(page, token: str) -> list:
     "forcedBuyback" and "paidBack" - never observed on the account, so only
     inferred. `buyback_guarantee` is `loan_buyback_guarantee == 1`. `base_term` is the loan's original term
     (see _base_term), None if unknown."""
-    data = _fetch_json(page, INVESTMENTS_URL, token)
+    data = _fetch_json(page, f"{INVESTMENTS_URL}?page_size={INVESTMENTS_DEFAULT_PAGE_SIZE}", token)
     items = data.get("items") or []
-    if len(items) < data.get("total", len(items)):
-        log.warning("Only %d of %s investments returned - remaining-duration amounts are incomplete.", len(items), data.get("total"))
+    total = data.get("total", len(items))
+    if len(items) < total:
+        # More investments than the default page size: ask for exactly `total` rows.
+        log.info("Only %d of %s investments returned - retrying with page_size=%s.", len(items), total, total)
+        data = _fetch_json(page, f"{INVESTMENTS_URL}?page_size={total}", token)
+        items = data.get("items") or []
+    if len(items) < total:
+        raise RuntimeError(f"Only {len(items)} of {total} investments returned - remaining-duration amounts would be incomplete.")
     investments = []
     for item in items:
         try:
@@ -479,11 +491,23 @@ def fetch_investments(page, token: str) -> list:
     return investments
 
 
+def companies_from_investments(investments: list) -> list:
+    """Per-originator outstanding totals [{"name", "amount"}] summed from the investments, i.e. the same
+    figures as the 'durée'/'taux' sheets (the investor-details chart can lag behind them)."""
+    totals = {}
+    for inv in investments:
+        if inv["outstanding"] > 0:
+            totals[inv["originator"]] = totals.get(inv["originator"], 0.0) + inv["outstanding"]
+    return sorted(({"name": n, "amount": round(a, 2)} for n, a in totals.items()), key=lambda c: c["amount"], reverse=True)
+
+
 # Lateness bucket -> minimum days late, only used when overdue_base_date is unusable.
 LATE_BUCKET_MIN_DAYS = {"1-15d": 1, "16-30d": 16, "31-60d": 31}
 # More than 60 days late. "Buyback initiated" was observed live 2026-10-31 (loan_is_active 0, nothing received yet,
 # loan_buyback_guarantee 1): the originator owes the buyback, so it is only a loss ("default") if the loan has no buyback guarantee.
 DEFAULT_STATUSES = {"60+d", "buyback initiated", "buybackinitiated"}
+# Explicit buyback status of the API: the "durée" tab needs no buyback delay for this platform (see google_sheet.API_BUYBACK_PLATFORMS).
+BUYBACK_STATUSES = {"buyback initiated", "buybackinitiated"}
 NON_LATE_STATUSES = {"", "current", "paid back", "paidback", "forced buyback", "forcedbuyback"}
 # A guaranteed loan still "Buyback initiated" after shared.remaining_duration.DEFAULT_AFTER_LATE_DAYS of lateness is
 # counted as a default (buyback not honored); the platform exposes no "buyback failed" status.
@@ -509,14 +533,17 @@ def _overdue_term(inv: dict, today: date):
     if beyond_60_days and not is_default:
         late_days = (today - overdue_since).days if overdue_since else 61
         log.warning("%s (%.2f EUR): %s, %d days late - buyback guaranteed but not paid yet.", inv.get("originator"), inv.get("outstanding", 0.0), inv.get("status"), late_days)
-        if late_days > DEFAULT_AFTER_LATE_DAYS:
+        if late_days > default_after_late_days("Income Marketplace", inv.get("originator")):
             log.warning("Buyback still unpaid after %d days of grace - counted as a default.", BUYBACK_GRACE_DAYS)
             is_default = True
     min_days = 61 if beyond_60_days else LATE_BUCKET_MIN_DAYS.get(status)
-    return (
+    term = (
         overdue_months_and_days(today, overdue_since or today, default=is_default)
         or overdue_months_and_days(today, today - timedelta(days=min_days), default=is_default)
     )
+    if term is not None and len(term) == 2 and not is_default and status in BUYBACK_STATUSES:
+        term = (-term[0], -term[1], "buyback")
+    return term
 
 
 def aggregate_remaining_durations(investments: list, today: date, rates: RateWeights | None = None) -> dict:
@@ -525,7 +552,7 @@ def aggregate_remaining_durations(investments: list, today: date, rates: RateWei
     {originator: {(months, days): outstanding}}. Late loans (status "1-15d"/
     "16-30d"/"31-60d", verified live) use the negated lateness since the missed
     payment date; "Buyback initiated" (60+ days, verified live 2026-10-31) ones
-    too while the loan has a buyback guarantee, otherwise with a "default"
+    get the "buyback" key variant while the loan has a buyback guarantee, otherwise a "default"
     marker (see _overdue_term). Fully repaid investments are ignored;
     non-late ones without a maturity date are skipped (with a warning)."""
     result = {}
@@ -565,26 +592,31 @@ def fetch_all_statement_transactions(page, token: str, start_date: date, end_dat
     higher) returns a PDF blob instead of JSON (verified live 2026-09-08,
     `Page.evaluate: SyntaxError: ... is not valid JSON` - the response body
     starts with the PDF magic bytes "%PDF-1.4", not an empty/next JSON
-    page). So this ONLY ever requests page 0 - safe for this small/new
-    account (confirmed live: a full lifetime fetch returns everything in
-    one page), but if a future run's row count for any category looks
-    suspiciously close to a true page-size limit, that would silently
-    truncate history with no error raised - the warning below is a
-    best-effort tripwire for that, not a real fix (no known way to safely
-    request "the next page" was found)."""
-    STATEMENT_ROW_COUNT_WARNING_THRESHOLD = 200
+    page). So only page 0 is ever requested, and the date range is what gets
+    "paginated" instead: if any category of a response reaches
+    STATEMENT_ROW_COUNT_SPLIT_THRESHOLD rows (a possible page-size limit),
+    the range is split in two halves (disjoint, both inclusive) that are
+    fetched separately, recursively, down to a single day (a single day
+    still at the threshold raises rather than silently truncating)."""
     body = fetch_account_statement(page, token, start_date, end_date, page_num=0)
+    groups = body.get("statement", [])
+    if any(len(group.get("turnover", [])) >= STATEMENT_ROW_COUNT_SPLIT_THRESHOLD for group in groups):
+        if start_date >= end_date:
+            raise RuntimeError(
+                f"Account statement for {start_date} still returns {STATEMENT_ROW_COUNT_SPLIT_THRESHOLD}+ rows in a "
+                "category on a single day - it may be truncated by a page-size limit that can't be paged past."
+            )
+        middle = start_date + (end_date - start_date) // 2
+        log.info("Account statement (%s to %s) hit the row threshold - splitting at %s.", start_date, end_date, middle)
+        return (
+            fetch_all_statement_transactions(page, token, start_date, middle)
+            + fetch_all_statement_transactions(page, token, middle + timedelta(days=1), end_date)
+        )
     all_transactions = []
-    for group in body.get("statement", []):
+    for group in groups:
         account_type = group.get("account_type")
         account_type_name = group.get("account_type_name")
         rows = group.get("turnover", [])
-        if len(rows) >= STATEMENT_ROW_COUNT_WARNING_THRESHOLD:
-            log.warning(
-                "Category %s (%s) returned %d rows, close to/at a possible page-size limit - "
-                "history may be silently truncated (page 1+ is known to return a PDF, not more JSON).",
-                account_type, account_type_name, len(rows),
-            )
         for row in rows:
             all_transactions.append({
                 "account_type": account_type,
@@ -696,11 +728,14 @@ def run() -> None:
             today_date = get_report_date()
 
             remaining_durations = None
+            investments_companies = None
             duration_rates = RateWeights()
             if current_month:
                 # Own try/except: the "durée" tab is a secondary view, its failure must not fail the whole run.
                 try:
-                    remaining_durations = aggregate_remaining_durations(fetch_investments(page, token), today_date, duration_rates)
+                    investments = fetch_investments(page, token)
+                    investments_companies = companies_from_investments(investments)
+                    remaining_durations = aggregate_remaining_durations(investments, today_date, duration_rates)
                     durations_total = sum(a for terms in remaining_durations.values() for a in terms.values())
                     if abs(durations_total - overview["invested_total"]) > 0.01:
                         log.warning(
@@ -720,7 +755,10 @@ def run() -> None:
 
             try:
                 month_start_date = today_date.replace(day=1)
-                this_month_transactions = fetch_all_statement_transactions(page, token, month_start_date, today_date)
+                this_month_transactions = retry_call(
+                    lambda: fetch_all_statement_transactions(page, token, month_start_date, today_date),
+                    "this month's statement transactions",
+                )
                 gross_interest = sum(t["amount"] for t in this_month_transactions if t["account_type"] == INTEREST_TYPE)
                 bonus = sum(t["amount"] for t in this_month_transactions if t["account_type"] == BONUS_TYPE)
                 amounts["gross_interest_received"] = gross_interest
@@ -731,7 +769,8 @@ def run() -> None:
                     gross_interest, bonus,
                 )
             except Exception:
-                log.exception("Failed to fetch this month's statement totals - defaulting interest/bonus to 0.0.")
+                log.exception("Failed to fetch this month's statement totals - aborting rather than writing 0 to the Sheet.")
+                sys.exit(1)
 
             # Since-inception XIRR/Cash drag block - see module docstring.
             xirr_value = None
@@ -1011,19 +1050,30 @@ def run() -> None:
     )
 
     if current_month:
-        fill_geographic_repartition_amounts(overview["companies"], platform="Income Marketplace")
+        companies = overview["companies"]
+        if investments_companies is not None:
+            chart = {c["name"]: c["amount"] for c in companies}
+            for c in investments_companies:
+                if abs(c["amount"] - chart.get(c["name"], 0.0)) > 0.01:
+                    log.warning(
+                        "%s: investor-details chart says %.2f EUR but the investments add up to %.2f EUR - using the investments.",
+                        c["name"], chart.get(c["name"], 0.0), c["amount"],
+                    )
+            companies = investments_companies
+        fill_geographic_repartition_amounts(companies, platform="Income Marketplace")
         fill_geographic_repartition_uninvested_amount("Income Marketplace", overview["cash_balance"])
 
         if remaining_durations is not None:
             try:
-                fill_remaining_duration_amounts("Income Marketplace", remaining_durations, rates=duration_rates)
+                fill_remaining_duration_amounts("Income Marketplace", remaining_durations, rates=duration_rates, reclassify_buyback=False)
             except Exception:
                 log.exception("Failed to update the 'durée' sheet for Income Marketplace.")
-
-            try:
-                fill_rate_amounts("Income Marketplace", duration_rates)
-            except Exception:
-                log.exception("Failed to update the 'taux' sheet for Income Marketplace.")
+            else:
+                # Only when the durations were filled: an empty `duration_rates` would wipe the base-term rows of "taux".
+                try:
+                    fill_rate_amounts("Income Marketplace", duration_rates)
+                except Exception:
+                    log.exception("Failed to update the 'taux' sheet for Income Marketplace.")
 
 
 if __name__ == "__main__":

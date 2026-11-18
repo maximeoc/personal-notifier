@@ -183,6 +183,7 @@ from shared.remaining_duration import (
     remaining_months_and_days,
 )
 from shared.report_date import get_report_date, is_current_month
+from shared.retry import retry_call
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
@@ -202,7 +203,6 @@ TRANSACTIONS_SUMMARY_URL = f"{API_BASE}/loans/api/balances/v3/transactions-summa
 ALL_TRANSACTIONS_URL = f"{API_BASE}/loans/api/balances/v3/all-transactions"
 INVESTMENT_ENTRIES_URL = f"{API_BASE}/loans/api/investments/entries/v3"
 INVESTMENT_ENTRIES_PAGE_SIZE = 500
-MAX_INVESTMENT_ENTRIES_PAGES = 50
 
 DEBITUM_EMAIL = os.environ.get("DEBITUM_EMAIL")
 DEBITUM_PASSWORD = os.environ.get("DEBITUM_PASSWORD")
@@ -219,7 +219,6 @@ _BASE_HEADERS = {
 }
 
 ALL_TRANSACTIONS_PAGE_SIZE = 500
-MAX_ALL_TRANSACTIONS_PAGES = 50
 
 # XIRR is a since-inception money-weighted return - this start date is
 # early enough to cover any real account's full history.
@@ -342,7 +341,7 @@ def _fetch_investment_entries(session: requests.Session, headers: dict, body: di
     """All pages of `POST /gtw/loans/api/investments/entries/v3` for `body`."""
     entries = []
     page = 0
-    while page < MAX_INVESTMENT_ENTRIES_PAGES:
+    while True:
         r = session.post(
             INVESTMENT_ENTRIES_URL, params={"page": page, "size": INVESTMENT_ENTRIES_PAGE_SIZE},
             json=body, headers=headers, timeout=20,
@@ -352,8 +351,7 @@ def _fetch_investment_entries(session: requests.Session, headers: dict, body: di
         entries.extend(page_data.get("content") or [])
         page += 1
         if page >= (page_data.get("page") or {}).get("totalPages", 0):
-            break
-    return entries
+            return entries
 
 
 def _parse_entry_date(raw) -> date | None:
@@ -520,7 +518,8 @@ def fetch_all_transactions(session: requests.Session, headers: dict, start_date:
     """Fetch every transaction in [start_date, end_date] (inclusive),
     paginating via the response's own `page.totalPages`/`page.number`."""
     all_transactions = []
-    for page in range(MAX_ALL_TRANSACTIONS_PAGES):
+    page = 0
+    while True:
         data = _fetch_all_transactions_page(session, headers, start_date, end_date, page)
         rows = data.get("content", [])
         log.info("all-transactions page %d: %d row(s) fetched.", page, len(rows))
@@ -528,8 +527,7 @@ def fetch_all_transactions(session: requests.Session, headers: dict, start_date:
         page_info = data.get("page", {})
         if page + 1 >= page_info.get("totalPages", 1):
             break
-    else:
-        log.warning("Hit MAX_ALL_TRANSACTIONS_PAGES (%d) - history may be truncated.", MAX_ALL_TRANSACTIONS_PAGES)
+        page += 1
     return all_transactions
 
 
@@ -681,7 +679,10 @@ def run() -> None:
     }
 
     try:
-        month_summary = fetch_transactions_summary(session, headers, month_start_date, today_date)
+        month_summary = retry_call(
+            lambda: fetch_transactions_summary(session, headers, month_start_date, today_date),
+            "this month's transactions summary",
+        )
         gross_interest = month_summary.get("interest", 0.0) or 0.0
         withholding_tax = month_summary.get("totalTax", 0.0) or 0.0
         amounts["gross_interest_received"] = gross_interest
@@ -694,7 +695,8 @@ def run() -> None:
             gross_interest, withholding_tax, amounts["bonus_cashback_contest"],
         )
     except Exception:
-        log.exception("Failed to fetch this month's transactions summary - defaulting interest/tax/bonus to 0.0.")
+        log.exception("Failed to fetch this month's transactions summary - aborting rather than writing 0 to the Sheet.")
+        sys.exit(1)
 
     # Since-inception XIRR/Cash drag block - see module docstring for the
     # full methodology (mirrors nectaro_diversification.py's design).
@@ -1012,11 +1014,12 @@ def run() -> None:
             )
         except Exception:
             log.exception("Failed to update the 'durée' sheet for Debitum.")
-
-        try:
-            fill_rate_amounts("Debitum", rates)
-        except Exception:
-            log.exception("Failed to update the 'taux' sheet for Debitum.")
+        else:
+            # Only when the durations were fetched: an empty `rates` would wipe the base-term rows of "taux".
+            try:
+                fill_rate_amounts("Debitum", rates)
+            except Exception:
+                log.exception("Failed to update the 'taux' sheet for Debitum.")
 
 
 if __name__ == "__main__":

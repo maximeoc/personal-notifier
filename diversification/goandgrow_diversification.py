@@ -120,6 +120,7 @@ from shared.loan_durations import record_constant_duration
 from shared.remaining_duration import RateWeights
 from shared.rate_sheet import fill_rate_amounts
 from shared.report_date import get_report_now, is_current_month
+from shared.retry import retry_call
 from shared.session_cache import get_or_refresh_session
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
 from shared.monthly_yield_waterfall import compute_monthly_yield_shares
@@ -495,12 +496,13 @@ def run() -> None:
         sys.exit(1)
 
     try:
-        entries = fetch_all_statement_entries(session)
-        statement_totals = fetch_current_month_statement_totals(session, entries=entries)
+        entries = retry_call(lambda: fetch_all_statement_entries(session), "statement entries")
+        statement_totals = retry_call(
+            lambda: fetch_current_month_statement_totals(session, entries=entries), "this month's statement totals"
+        )
     except Exception:
-        log.exception("Failed to fetch this month's statement totals - defaulting to 0.0.")
-        entries = []
-        statement_totals = {"interest_received": 0.0, "bonus_cashback_contest": 0.0, "fees": 0.0, "closing_balance": None}
+        log.exception("Failed to fetch this month's statement totals - aborting rather than writing 0 to the Sheet.")
+        sys.exit(1)
 
     log.info("Go & Grow balance: %.2f EUR", balance)
     log.info(
@@ -734,11 +736,12 @@ def run() -> None:
             fill_remaining_duration_amounts(PLATFORM_LABEL, durations, platform_level=True, rates=rates)
         except Exception:
             log.exception("Failed to update the 'durée' sheet for Go & Grow.")
-
-        try:
-            fill_rate_amounts(PLATFORM_LABEL, rates, platform_level=True)
-        except Exception:
-            log.exception("Failed to update the 'taux' sheet for Go & Grow.")
+        else:
+            # Only when the durations were filled: a half-built `rates` would wipe the base-term rows of "taux".
+            try:
+                fill_rate_amounts(PLATFORM_LABEL, rates, platform_level=True)
+            except Exception:
+                log.exception("Failed to update the 'taux' sheet for Go & Grow.")
 
 
 if __name__ == "__main__":

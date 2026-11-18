@@ -121,7 +121,10 @@ jobs:
 
       - name: Install Playwright Chromium (cache miss only)
         if: steps.playwright-cache.outputs.cache-hit != 'true'
-        run: playwright install --with-deps chromium
+        run: |
+          playwright install chromium
+          # Ubuntu apt mirrors can be unreachable for hours; the image already ships the core libs.
+          playwright install-deps chromium || echo "::warning::install-deps failed (apt unreachable), continuing"
 
       - name: Install Playwright OS dependencies (cache hit)
         if: steps.playwright-cache.outputs.cache-hit == 'true'
@@ -132,7 +135,7 @@ jobs:
         # a no-op download-wise if the binary is already present.
         run: |
           playwright install chromium
-          playwright install-deps chromium
+          playwright install-deps chromium || echo "::warning::install-deps failed (apt unreachable), continuing"
 
       - name: Restore persisted state (session cookies)
         uses: actions/cache/restore@v4
@@ -200,6 +203,7 @@ jobs:
           path: |
             diversification/iuvo_diversification_session_state.json
             diversification/iuvo_xirr_cashflows_state.json
+            diversification/iuvo_daily_state.json
             diversification/iuvo_duration_status_state.json
             diversification/iuvo_rate_history_state.json
           key: iuvo-diversification-state-${{ github.run_id }}
@@ -221,6 +225,7 @@ jobs:
           path: |
             diversification/iuvo_diversification_session_state.json
             diversification/iuvo_xirr_cashflows_state.json
+            diversification/iuvo_daily_state.json
             diversification/iuvo_duration_status_state.json
             diversification/iuvo_rate_history_state.json
           key: iuvo-diversification-state-${{ github.run_id }}
@@ -384,6 +389,7 @@ jobs:
           path: |
             diversification/lendermarket_diversification_session_state.json
             diversification/lendermarket_xirr_cashflows_state.json
+            diversification/lendermarket_daily_state.json
             diversification/lendermarket_duration_status_state.json
             diversification/lendermarket_rate_history_state.json
           key: lendermarket-diversification-state-${{ github.run_id }}
@@ -406,6 +412,7 @@ jobs:
           path: |
             diversification/lendermarket_diversification_session_state.json
             diversification/lendermarket_xirr_cashflows_state.json
+            diversification/lendermarket_daily_state.json
             diversification/lendermarket_duration_status_state.json
             diversification/lendermarket_rate_history_state.json
           key: lendermarket-diversification-state-${{ github.run_id }}
@@ -507,6 +514,7 @@ jobs:
           path: |
             diversification/monefit_diversification_session_state.json
             diversification/monefit_xirr_cashflows_state.json
+            diversification/monefit_daily_state.json
             diversification/monefit_duration_status_state.json
             diversification/monefit_rate_history_state.json
           key: monefit-diversification-state-${{ github.run_id }}
@@ -528,6 +536,7 @@ jobs:
           path: |
             diversification/monefit_diversification_session_state.json
             diversification/monefit_xirr_cashflows_state.json
+            diversification/monefit_daily_state.json
             diversification/monefit_duration_status_state.json
             diversification/monefit_rate_history_state.json
           key: monefit-diversification-state-${{ github.run_id }}
@@ -858,13 +867,15 @@ jobs:
 
       - name: Install Playwright Chromium (cache miss only)
         if: steps.playwright-cache.outputs.cache-hit != 'true'
-        run: playwright install --with-deps chromium
+        run: |
+          playwright install chromium
+          playwright install-deps chromium || echo "::warning::install-deps failed (apt unreachable), continuing"
 
       - name: Install Playwright OS dependencies (cache hit)
         if: steps.playwright-cache.outputs.cache-hit == 'true'
         run: |
           playwright install chromium
-          playwright install-deps chromium
+          playwright install-deps chromium || echo "::warning::install-deps failed (apt unreachable), continuing"
 
       # Session (accessToken) reuse persisted via storage_state, on top of
       # the XIRR cashflow cache below - avoids a real 2FA/TOTP login on

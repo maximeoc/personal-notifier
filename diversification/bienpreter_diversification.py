@@ -208,12 +208,15 @@ Optional:
 import re
 import os
 import sys
+import time
 import html
 import logging
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from dotenv import load_dotenv
 
 from shared.google_sheet import (
@@ -227,6 +230,7 @@ from shared.loan_durations import DurationExtraction, LoanDuration, months_betwe
 from shared.rate_sheet import fill_rate_amounts
 from shared.remaining_duration import RateWeights, overdue_months_and_days, remaining_months_and_days
 from shared.report_date import get_report_now, is_current_month
+from shared.retry import retry_call
 from shared.session_cache import get_or_refresh_session, save_session_state
 from shared.notifier import send_bienpreter_geo_issues_email
 from shared.state import load_state, save_state
@@ -245,7 +249,6 @@ log = logging.getLogger("bienpreter_diversification")
 LOGIN_URL = "https://www.bienpreter.com/connexion"
 DASHBOARD_URL = "https://www.bienpreter.com/u/tableau-de-bord"
 OPERATIONS_URL = "https://www.bienpreter.com/u/operations"
-MAX_OPERATIONS_PAGES = 300  # safety cap against an infinite loop if pagination ever misbehaves
 # Bienpreter is a French platform; "this month" below means the current
 # calendar month up to TODAY (1st of the month through today, NOT the full
 # month) - same semantics verified for Swaper's "This Month" / Afranga's
@@ -273,6 +276,22 @@ BIENPRETER_EMAIL = os.environ.get("BIENPRETER_EMAIL")
 BIENPRETER_PASSWORD = os.environ.get("BIENPRETER_PASSWORD")
 
 _HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+
+def _build_session() -> requests.Session:
+    """Session that retries idempotent GETs on read/connect timeouts and 502/503/504
+    (www.bienpreter.com intermittently hangs > 30s, observed 2026-11-06)."""
+    session = requests.Session()
+    session.headers.update(_HEADERS)
+    retry = Retry(
+        total=4, connect=4, read=4, status=4,
+        backoff_factor=3, status_forcelist=(502, 503, 504),
+        allowed_methods=frozenset(["GET"]), raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
 
 def login(session: requests.Session) -> str:
@@ -391,7 +410,6 @@ API_TOKEN_URL = "https://www.bienpreter.com/api-token-from-session"
 ACTIVE_LOANS_API_URL = "https://www.bienpreter.com/api/v2/contracts/me"
 ACTIVE_LOANS_PAGE_SIZE = 100
 LOAN_STATUS_ACTIVE = "3"  # criteria[status][] = "en cours"
-MAX_ACTIVE_LOANS_PAGES = 20  # safety net against an infinite loop
 PROJECT_API_URL = "https://www.bienpreter.com/api/v2/project/{project_id}"
 USER_ME_API_URL = "https://www.bienpreter.com/api/v2/user/me"
 # `criteria[litigation]` filter (same values as the old HTML page's
@@ -399,6 +417,8 @@ USER_ME_API_URL = "https://www.bienpreter.com/api/v2/user/me"
 # 12 = "Prêts en défaut (retard > 6 mois)" (1 = either of them).
 LITIGATION_LATE = "11"
 LITIGATION_DEFAULT = "12"
+CONTRACT_DATES_ATTEMPTS = 4
+CONTRACT_DATES_RETRY_DELAY = 5.0
 
 
 def _parse_active_loans_results(results: list) -> list:
@@ -477,23 +497,24 @@ def _get_contracts_page(session: requests.Session, params: dict) -> dict:
 def fetch_active_loans(session: requests.Session, litigation: str = ""):
     """Fetches every currently active ("en cours") Bienprêter loan from the
     JSON API (/api/v2/contracts/me, see ACTIVE_LOANS_API_URL), paginating
-    via `page`/`limit` until the API's own `total` is reached (bounded by
-    MAX_ACTIVE_LOANS_PAGES as a safety net). `litigation` optionally
+    via `page`/`limit` until the API's own `total` is reached. `litigation` optionally
     restricts it to late (LITIGATION_LATE) or defaulted (LITIGATION_DEFAULT)
     loans. Returns (loans, issues):
     - loans : flat list of {"project_id", "borrower", "amount",
       "contract_id", "next_payment_date"} dicts, one per loan/contract (a
       single borrower can appear multiple times, once per contract).
-    - issues : list of short strings describing a pagination problem (hit
-      the page safety net, or collected a different number of loans than
-      the API's own `total` - both signal the result may be incomplete) -
+    - issues : list of short strings describing a pagination problem (collected
+      a different number of loans than
+      the API's own `total` - signals the result may be incomplete) -
       feeds shared.notifier.send_bienpreter_geo_issues_email()."""
     loans = []
     issues = []
     seen_contract_ids = set()
     expected_total = None
     _refresh_api_token(session)
-    for page_number in range(1, MAX_ACTIVE_LOANS_PAGES + 1):
+    page_number = 0
+    while True:
+        page_number += 1
         params = {
             "page": page_number,
             "limit": ACTIVE_LOANS_PAGE_SIZE,
@@ -521,13 +542,6 @@ def fetch_active_loans(session: requests.Session, litigation: str = ""):
         loans.extend(rows)
         if expected_total is not None and page_number * ACTIVE_LOANS_PAGE_SIZE >= expected_total:
             break
-    else:
-        message = (
-            f"Pagination des prêts actifs interrompue après {MAX_ACTIVE_LOANS_PAGES} pages sans "
-            "atteindre le total attendu - les résultats sont peut-être incomplets."
-        )
-        log.warning(message)
-        issues.append(message)
 
     if expected_total is not None and len(loans) != expected_total:
         message = (
@@ -683,12 +697,24 @@ def fetch_contract_dates(session: requests.Session, contract_id: str) -> tuple:
     behind the "Gérer mon prêt" page, /api/v1/contracts/{id} (verified live
     2026-10-16): maturity = "refundDateEstimation" (YYYY-MM-DD; 1st due +
     duesLeft - 1 months), next_due = "nextDue.dueDate" (the next instalment
-    to be received). Either is None if absent."""
-    r = session.get(
-        f"https://www.bienpreter.com/api/v1/contracts/{contract_id}",
-        headers={"Accept": "application/ld+json"},
-        timeout=30,
-    )
+    to be received). Either is None if absent.
+
+    Retried on 403/429 (observed 2026-11-13 in GitHub Actions: 42 of 55
+    contracts in a row answered 403 after ~13 calls, while the very same
+    calls all succeed from a local machine - transient anti-bot/rate
+    limiting), re-fetching the API token and backing off between attempts."""
+    url = f"https://www.bienpreter.com/api/v1/contracts/{contract_id}"
+    for attempt in range(1, CONTRACT_DATES_ATTEMPTS + 1):
+        r = session.get(url, headers={"Accept": "application/ld+json"}, timeout=30)
+        if r.status_code not in (403, 429) or attempt == CONTRACT_DATES_ATTEMPTS:
+            break
+        wait = CONTRACT_DATES_RETRY_DELAY * attempt
+        log.warning(
+            "Contract %s: HTTP %s (attempt %d/%d) - refreshing the API token and retrying in %.0fs.",
+            contract_id, r.status_code, attempt, CONTRACT_DATES_ATTEMPTS, wait,
+        )
+        time.sleep(wait)
+        _refresh_api_token(session)
     r.raise_for_status()
     data = r.json()
     estimate = data.get("refundDateEstimation")
@@ -741,9 +767,11 @@ def aggregate_remaining_durations(session: requests.Session, loans: list, today:
         contract_id = loan.get("contract_id")
         try:
             maturity, next_due = fetch_contract_dates(session, contract_id) if contract_id else (None, None)
-        except Exception:
-            log.exception("Failed to fetch the dates of contract %s.", contract_id)
-            maturity, next_due = None, None
+        except Exception as exc:
+            # Abort instead of skipping the loan: the "durée"/"taux" sheets would
+            # otherwise be overwritten with a partial total (2026-11-13: 2468 EUR
+            # written instead of 6588 EUR after a burst of 403s).
+            raise RuntimeError(f"Failed to fetch the dates of contract {contract_id} - not writing partial durations.") from exc
         # Conservée pour l'onglet « durées prêts » (durations_from_contract_dates).
         loan["maturity_date"] = maturity
 
@@ -767,9 +795,8 @@ def aggregate_remaining_durations(session: requests.Session, loans: list, today:
             if project_id not in base_terms:
                 try:
                     base_terms[project_id] = fetch_project_base_term(session, project_id)
-                except Exception:
-                    log.exception("Failed to fetch the base term of project %s.", project_id)
-                    base_terms[project_id] = None
+                except Exception as exc:
+                    raise RuntimeError(f"Failed to fetch the base term of project {project_id} - not writing partial rates.") from exc
             if base_terms[project_id] is None:
                 log.warning("No base term found for a loan of %s (project %s) - excluded from the 'taux' sheet.", name, project_id)
             loan["base_term"] = base_terms[project_id]
@@ -870,24 +897,24 @@ def _fetch_operations_page(session: requests.Session, start_date: str, end_date:
 def fetch_all_operations(session: requests.Session, start_date: str, end_date: str) -> list:
     """Fetch EVERY /u/operations row within [start_date, end_date]
     ("YYYY-MM-DD" strings), paginating via the `page` query param until a
-    page returns no real rows (bounded by MAX_OPERATIONS_PAGES as a safety
-    net) - the shared pagination loop behind both
+    page returns no real rows - the shared pagination loop behind both
     fetch_current_month_interest_totals() (this month only) and
     get_cached_operations() (full/incremental history, for XIRR/Cash drag).
     """
     all_rows = []
-    for page_number in range(1, MAX_OPERATIONS_PAGES + 1):
+    previous_rows = None
+    page_number = 0
+    while True:
+        page_number += 1
         rows = _fetch_operations_page(session, start_date, end_date, page_number)
         rows = [r for r in rows if r.get("label")]
         log.info("Operations page %d (%s to %s): %d real row(s) found.", page_number, start_date, end_date, len(rows))
         if not rows:
             break
+        if rows == previous_rows:
+            raise RuntimeError(f"Operations pagination is not advancing (page {page_number} repeats page {page_number - 1}).")
+        previous_rows = rows
         all_rows.extend(rows)
-    else:
-        log.warning(
-            "Hit MAX_OPERATIONS_PAGES (%d) without an empty page (%s to %s) - results may be truncated.",
-            MAX_OPERATIONS_PAGES, start_date, end_date,
-        )
     return all_rows
 
 
@@ -1174,8 +1201,7 @@ def run() -> None:
 
     log.info("Starting Bienpreter diversification run (pure HTTP, no browser).")
 
-    session = requests.Session()
-    session.headers.update(_HEADERS)
+    session = _build_session()
 
     try:
         # The dashboard HTML is only an "is the persisted session still
@@ -1193,13 +1219,10 @@ def run() -> None:
 
     try:
         log.info("Fetching this month's interest totals from the operations page...")
-        interest_totals = fetch_current_month_interest_totals(session)
+        interest_totals = retry_call(lambda: fetch_current_month_interest_totals(session), "this month's interest totals")
     except Exception:
-        log.exception("Failed to fetch this month's interest totals - defaulting all figures to 0.0.")
-        interest_totals = {
-            "net_interest_received": 0.0, "withholding_tax": 0.0,
-            "gross_interest_received": 0.0, "bonus_total": 0.0,
-        }
+        log.exception("Failed to fetch this month's interest totals - aborting rather than writing 0 to the Sheet.")
+        sys.exit(1)
 
     total = balances["available_balance"] + balances["capital_to_receive"]
     interest_totals["total"] = total

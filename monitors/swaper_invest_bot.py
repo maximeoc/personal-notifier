@@ -237,6 +237,7 @@ throughout.
 """
 
 
+import contextlib
 import json
 import os
 import sys
@@ -284,6 +285,10 @@ SWAPER_CRON_JOB_ID = os.environ.get("SWAPER_CRON_JOB_ID")
 # monitors/peerberry_invest_bot.py).
 MIN_INVESTMENT_AMOUNT = float(os.environ.get("MIN_INVESTMENT_AMOUNT", "10"))
 
+# "dry" (selected through the workflow's manual-run "mode" input) plans the
+# investments but buys nothing; scheduled runs are always "live".
+DRY_RUN = os.environ.get("SWAPER_BOT_MODE", "live").strip().lower() == "dry"
+
 # Loans-listing page navigated to directly (fetch_loans() lets the real
 # Angular app fire the API call itself - see that function's docstring for
 # why a manually-built request gets 403).
@@ -292,6 +297,8 @@ LOANS_URL = "https://swaper.com/rest/public/loans"
 
 TWO_FACTOR_ATTEMPTS = 3
 TWO_FACTOR_REDIRECT_TIMEOUT_MS = 15000
+TWO_FACTOR_PROMPT_TIMEOUT_MS = 30000
+LOGIN_REDIRECT_TIMEOUT_MS = 30000
 
 
 class SwaperSessionExpired(RuntimeError):
@@ -329,10 +336,23 @@ def handle_two_factor(page) -> None:
     the same "Log In" div is reused to submit the code.
     """
     otp_input = page.locator("input[name='code']")
-    try:
-        otp_input.wait_for(timeout=8000)
-    except PlaywrightTimeoutError:
-        return  # no 2FA prompt shown, nothing to do
+    # Real GitHub Actions failure, 2026-11-05: after submitting credentials
+    # no 2FA prompt was seen within the old fixed 8s wait, and the page then
+    # never left /login within 20s either (slow login response / 2FA form
+    # appearing late). Now: wait up to TWO_FACTOR_PROMPT_TIMEOUT_MS for
+    # EITHER the 2FA input to show up OR the redirect away from /login.
+    deadline = time.time() + TWO_FACTOR_PROMPT_TIMEOUT_MS / 1000
+    while True:
+        if "/login" not in page.url:
+            return  # logged in without 2FA
+        try:
+            if otp_input.is_visible():
+                break
+        except Exception:
+            pass
+        if time.time() >= deadline:
+            return  # no 2FA prompt shown, login()'s final wait reports the outcome
+        time.sleep(0.5)
 
     if not SWAPER_TOTP_SECRET:
         raise RuntimeError(
@@ -498,7 +518,15 @@ def login(page) -> None:
     handle_two_factor(page)
 
     # Wait until we've left the login page (successful redirect to dashboard).
-    page.wait_for_url(lambda url: "/login" not in url, timeout=20000)
+    try:
+        page.wait_for_url(lambda url: "/login" not in url, timeout=LOGIN_REDIRECT_TIMEOUT_MS)
+    except PlaywrightTimeoutError:
+        try:
+            page_text = " ".join(page.locator("body").inner_text(timeout=2000).split())[:300]
+        except Exception:
+            page_text = "<unavailable>"
+        log.error("Login did not leave /login (url=%s). Page text: %s", page.url, page_text)
+        raise
     log.info("Logged in successfully, current URL: %s", page.url)
 
 
@@ -523,6 +551,32 @@ def _record_http_call(captured: list, method: str, url: str, request_headers: di
     captured.append(entry)
 
 
+@contextlib.contextmanager
+def _originator_filter(page, groups: list = None):
+    """Rewrite every outgoing `POST /rest/public/loans` of the SPA so it
+    carries `"groups": [...]` (no-op when `groups` is empty). Kept active
+    while investing too: after each buy the SPA silently re-fetches the list
+    with `groups: []`, which replaced the filtered rows by other originators'
+    loans and made every remaining loan of the plan "not found" (live-verified
+    2026-11-09: only the first loan of each run was ever bought)."""
+    def _patch_body(route):
+        try:
+            body = json.loads(route.request.post_data or "{}")
+        except Exception:
+            body = {}
+        body["groups"] = groups
+        route.continue_(post_data=json.dumps(body))
+
+    if not groups:
+        yield
+        return
+    page.route("**/rest/public/loans", _patch_body)
+    try:
+        yield
+    finally:
+        page.unroute("**/rest/public/loans", _patch_body)
+
+
 def fetch_loans(page, captured_api_calls: list, groups: list = None) -> dict:
     """Fetch the loans list by letting Swaper's own Angular SPA fire its
     REAL request (`page.goto()` to the loans page) - NOT a manually
@@ -545,26 +599,12 @@ def fetch_loans(page, captured_api_calls: list, groups: list = None) -> dict:
     `captured_api_calls`, feeding the investment summary/diagnostics
     emails.
     """
-    def _patch_body(route):
-        request = route.request
-        try:
-            body = json.loads(request.post_data or "{}")
-        except Exception:
-            body = {}
-        body["groups"] = groups
-        route.continue_(post_data=json.dumps(body))
-
-    if groups:
-        page.route("**/rest/public/loans", _patch_body)
-    try:
+    with _originator_filter(page, groups):
         with page.expect_response(
             lambda r: r.url == LOANS_URL and r.request.method == "POST"
         ) as response_info:
             page.goto(LOANS_PAGE_URL, wait_until="domcontentloaded")
         response = response_info.value
-    finally:
-        if groups:
-            page.unroute("**/rest/public/loans", _patch_body)
 
     request = response.request
     text = response.text()
@@ -800,7 +840,14 @@ def _extract_balance_from_attempts(attempts: list):
     return None
 
 
-def _invest_available_loans(page, loans: list, shares: dict, captured_api_calls: list) -> list:
+def _invest_available_loans(page, loans: list, shares: dict, captured_api_calls: list, groups: list = None) -> list:
+    """See `_invest_loans_via_ui()`. `groups` keeps the originator filter
+    applied to the SPA's list refreshes that follow every buy."""
+    with _originator_filter(page, groups):
+        return _invest_loans_via_ui(page, loans, shares, captured_api_calls)
+
+
+def _invest_loans_via_ui(page, loans: list, shares: dict, captured_api_calls: list) -> list:
     """Actually invest into available manual loans, using the exact
     per-loan amounts precomputed by `_compute_swaper_loan_shares()` (loans
     with no entry in `shares`, e.g. below the minimum, are skipped).
@@ -848,8 +895,12 @@ def _invest_available_loans(page, loans: list, shares: dict, captured_api_calls:
         if not amount or amount < MIN_INVESTMENT_AMOUNT:
             continue
 
+        # The list is re-fetched by the SPA after every buy: give the row a
+        # moment to reappear instead of failing on a transient empty table.
         row = page.locator("tr.loan-row", has_text=str(loan_label))
-        if row.count() == 0:
+        try:
+            row.first.wait_for(state="visible", timeout=10000)
+        except PlaywrightTimeoutError:
             log.warning("Could not find the row for loan %s on the page - skipping it.", loan_label)
             continue
         row = row.first
@@ -919,6 +970,15 @@ def _invest_available_loans(page, loans: list, shares: dict, captured_api_calls:
                     ):
                         break
                     page.wait_for_timeout(500)
+                # Let the SPA's post-buy list refresh land before touching the next row.
+                for _ in range(10):
+                    if any(
+                        c.get("method") == "POST" and c.get("url") == LOANS_URL
+                        for c in captured_api_calls[calls_before_confirm:]
+                    ):
+                        break
+                    page.wait_for_timeout(500)
+                page.wait_for_timeout(500)
             except Exception:
                 log.exception(
                     "Could not click the Confirm button for loan %s - stopping here rather than guessing.",
@@ -957,7 +1017,7 @@ def _invest_available_loans(page, loans: list, shares: dict, captured_api_calls:
 
 def run(headless: bool = True) -> None:
     # Before the startup wait: schedule check against the sheet + stop if no market is active.
-    disabled, wait_range = begin_run("Swaper", SWAPER_CRON_JOB_ID, CRON_SCHEDULE_STATE_FILE, 2, 30)
+    disabled, wait_range = begin_run("Swaper", SWAPER_CRON_JOB_ID, CRON_SCHEDULE_STATE_FILE)
     if disabled:
         return
 
@@ -1192,11 +1252,13 @@ def run(headless: bool = True) -> None:
                         )
 
                         pass_attempts = []
-                        if balance_now < MIN_INVESTMENT_AMOUNT:
+                        budget_now = config.investable_balance(balance_now)
+                        if budget_now < MIN_INVESTMENT_AMOUNT:
                             log.info(
-                                "Balance %.2f EUR is below the minimum (%.2f EUR) - availability was still "
-                                "checked above for diagnostics, but skipping the actual auto-invest step.",
-                                balance_now, MIN_INVESTMENT_AMOUNT,
+                                "Investable balance %.2f EUR (balance %.2f EUR minus %.2f EUR kept uninvested) is below the "
+                                "minimum (%.2f EUR) - availability was still checked above for diagnostics, but skipping "
+                                "the actual auto-invest step.",
+                                budget_now, balance_now, config.keep_uninvested, MIN_INVESTMENT_AMOUNT,
                             )
                         else:
                             # Per-country / per-originator caps ("Pourcentage max du
@@ -1260,7 +1322,7 @@ def run(headless: bool = True) -> None:
                             # One allocation across ALL candidate loans: per-originator
                             # rate bounds, min/max amount, caps and the "Répartition
                             # équivalente" flag (see shared/robot_config.py).
-                            plan = plan_allocations(candidates, tracker, balance_now, MIN_INVESTMENT_AMOUNT)
+                            plan = plan_allocations(candidates, tracker, budget_now, MIN_INVESTMENT_AMOUNT)
                             log.info("Investment plan (loan id -> EUR): %s", plan)
                             shares_by_name = {}
                             for candidate in candidates:
@@ -1269,9 +1331,14 @@ def run(headless: bool = True) -> None:
 
                             for name, shares in shares_by_name.items():
                                 log.info("Investing %.2f EUR into originator %r's loan(s).", sum(shares.values()), name)
+                                if DRY_RUN:
+                                    log.info("Dry run - nothing bought.")
+                                    continue
                                 try:
                                     attempts = _with_relogin_retry(
-                                        lambda: _invest_available_loans(page, loans_by_name[name], shares, captured_api_calls)
+                                        lambda: _invest_available_loans(
+                                            page, loans_by_name[name], shares, captured_api_calls, groups=[group_of[name]]
+                                        )
                                     )
                                 except Exception:
                                     log.exception("Failed to invest into originator %r's loan(s) - skipping it this run.", name)
@@ -1374,12 +1441,14 @@ def run(headless: bool = True) -> None:
     # shared/cron_schedule.py's own docstring) - poll faster while there's
     # money to invest. The two intervals come from the "Temps planification
     # solde (in)suffisant" columns of the Swaper row in "config robots"
-    # (defaults 30 min / 2 min).
-    sufficient = balance >= 10
-    ensure_schedule_interval(
-        resolve_schedule_minutes("Swaper", sufficient, 2 if sufficient else 30, robot_config),
-        cron_job_id=SWAPER_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE, sufficient=sufficient,
-    )
+    # (both required).
+    sufficient = (robot_config.investable_balance(balance) if robot_config else balance) >= 10
+    minutes = resolve_schedule_minutes("Swaper", sufficient, robot_config)
+    if minutes is not None:
+        ensure_schedule_interval(
+            minutes,
+            cron_job_id=SWAPER_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE, sufficient=sufficient,
+        )
 
     save_state(STATE_FILE, state)
 

@@ -167,10 +167,11 @@ from shared.google_sheet import (
     fill_geographic_repartition_amounts,
     fill_geographic_repartition_uninvested_amount,
     fill_remaining_duration_amounts,
+    buyback_days_for,
+    default_after_late_days,
 )
 from shared.rate_sheet import fill_rate_amounts
 from shared.remaining_duration import (
-    DEFAULT_AFTER_LATE_DAYS,
     RateWeights,
     base_term_between,
     base_term_from_days,
@@ -179,12 +180,14 @@ from shared.remaining_duration import (
 )
 from shared.loan_durations import durations_from_json_items, parse_amount, record_platform_loan_durations
 from shared.report_date import get_report_now, is_current_month
+from shared.retry import retry_call
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL
 from shared.monthly_yield_waterfall import compute_monthly_yield_shares
 from shared.xirr import compute_xirr
 from shared.xirr_waterfall import compute_waterfall_xirr_shares
+from shared.daily_balances import DailyBalances, build_daily_balances, first_active_day, previous_month_range, refresh_daily_cache
 
 load_dotenv()
 
@@ -215,6 +218,8 @@ REPORT_TIMEZONE = ZoneInfo("Europe/Paris")
 SESSION_STATE_FILE = Path(__file__).parent / "lendermarket_diversification_session_state.json"
 XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "lendermarket_xirr_cashflows_state.json"
 XIRR_CASHFLOWS_STATE_DEFAULT = {"monthly_summaries": {}, "last_fetched_month": None}
+# One statement query per calendar day (real deposit dates, true daily balances) - see shared/daily_balances.py.
+DAILY_STATE_FILE = Path(__file__).parent / "lendermarket_daily_state.json"
 # Conservative floor for the one-time yearly scan used to find the
 # account's real inception year (see _find_first_active_year()) - well
 # before Lendermarket existed, just a safety bound on the scan length.
@@ -297,12 +302,13 @@ def aggregate_remaining_durations(investments: list, today: date, rates=None) ->
     128 active investments, all with `loan.status` still "ACTIVE" and
     `nextPaymentDate` = the missed due date = today - loanOverdueDays) are
     grouped by overdue_months_and_days() since that missed payment date
-    instead, falling back to today - loanOverdueDays. Defaulted loans
-    (`loan.status` "DEFAULT"/"DEFAULTED" - INFERRED, no defaulted loan on the
+    instead, falling back to today - loanOverdueDays. Loans past their final
+    (extended) maturity by at least the originator's buyback delay ("durée" tab) get the "buyback"
+    key variant, those past it by more than that delay + the grace period
+    (every loan has `hasBuybackGuarantee`, so the buyback is still unpaid) or with
+    `loan.status` "DEFAULT"/"DEFAULTED" (INFERRED, no defaulted loan on the
     account to verify; active/finished investments only ever showed ACTIVE/
-    FINISHED) or loans more than DEFAULT_AFTER_LATE_DAYS overdue (every loan
-    has `hasBuybackGuarantee`, so the buyback is still unpaid) get the
-    "default" key variant. Otherwise the remaining term
+    FINISHED) the "default" one. Otherwise the remaining term
     above applies."""
     result = {}
     for inv in investments:
@@ -325,12 +331,17 @@ def aggregate_remaining_durations(investments: list, today: date, rates=None) ->
             overdue_days = int(loan.get("loanOverdueDays") or 0)
         except (TypeError, ValueError):
             overdue_days = 0
+        # The buyback guarantee activates N days after the FINAL maturity (`finalPaymentDate` already includes the
+        # extensions used, verified live 2026-11-09), not N days after a missed instalment.
+        past_maturity = (today - maturity).days
+        buyback_days = buyback_days_for("Lendermarket", lender_name)
         is_default = (
             str(loan.get("status") or "").upper() in ("DEFAULT", "DEFAULTED")
-            or overdue_days > DEFAULT_AFTER_LATE_DAYS
+            or past_maturity > default_after_late_days("Lendermarket", lender_name)
         )
+        is_buyback = not is_default and bool(buyback_days) and past_maturity >= buyback_days
         term = None
-        if overdue_days > 0 or is_default:
+        if overdue_days > 0 or is_default or is_buyback:
             try:
                 missed_due_date = date.fromisoformat(inv["nextPaymentDate"][:10])
             except (KeyError, TypeError, ValueError):
@@ -338,6 +349,10 @@ def aggregate_remaining_durations(investments: list, today: date, rates=None) ->
             term = missed_due_date and overdue_months_and_days(today, missed_due_date, default=is_default)
             if term is None and overdue_days > 0:
                 term = overdue_months_and_days(today, today - timedelta(days=overdue_days), default=is_default)
+            if term is None and (is_default or is_buyback):
+                term = overdue_months_and_days(today, maturity, default=is_default)
+            if is_buyback and term is not None and len(term) == 2:
+                term = (-term[0], -term[1], "buyback")
         if term is None:
             term = remaining_months_and_days(today, maturity)
         durations = result.setdefault(lender_name, {})
@@ -350,7 +365,7 @@ def aggregate_remaining_durations(investments: list, today: date, rates=None) ->
     return result
 
 
-def fetch_statement_summary(session: requests.Session, investor_id: str, start_date: date, end_date: date) -> dict:
+def fetch_statement_summary(session: requests.Session, investor_id: str, start_date: date, end_date: date, quiet: bool = False) -> dict:
     """Fetch getInvestorAccountStatementSummary for an arbitrary
     [start_date, end_date] range - generalized 2026-08-14 (was
     fetch_current_month_statement_totals(), hardcoded to the current
@@ -370,7 +385,8 @@ def fetch_statement_summary(session: requests.Session, investor_id: str, start_d
     """
     start_str = start_date.strftime("%Y-%m-%d")
     end_str = end_date.strftime("%Y-%m-%d")
-    log.info("Requesting account statement summary API for %s to %s...", start_str, end_str)
+    log_level = logging.DEBUG if quiet else logging.INFO
+    log.log(log_level, "Requesting account statement summary API for %s to %s...", start_str, end_str)
 
     r = session.get(
         STATEMENT_SUMMARY_API_URL,
@@ -378,12 +394,12 @@ def fetch_statement_summary(session: requests.Session, investor_id: str, start_d
         headers=_xsrf_headers(session, investor_id),
         timeout=20,
     )
-    log.info("Account statement summary API response: status=%s", r.status_code)
+    log.log(log_level, "Account statement summary API response: status=%s", r.status_code)
     if not r.ok:
         raise RuntimeError(f"Account statement summary API returned status {r.status_code}")
 
     data = (r.json() or {}).get("data") or {}
-    log.info("Raw statement summary data: %r", data)
+    log.log(log_level, "Raw statement summary data: %r", data)
 
     def _amount(key):
         try:
@@ -406,7 +422,8 @@ def fetch_statement_summary(session: requests.Session, investor_id: str, start_d
     investment_amount = _amount("investorInvestmentAmount")
     received_principal_amount = _amount("investorReceivedPrincipalAmount")
 
-    log.info(
+    log.log(
+        log_level,
         "Parsed statement totals: interest_received=%.2f, bonuses=%.2f, fees=%.2f, "
         "opening_balance=%.2f, closing_balance=%.2f, deposits=%.2f, withdrawals=%.2f, "
         "investment_amount=%.2f, received_principal_amount=%.2f",
@@ -579,6 +596,29 @@ def compute_average_invested(monthly_summaries_as_of: dict, monthly_summaries: d
     return total_weighted / total_days if total_days else None
 
 
+def fetch_daily_record(session: requests.Session, investor_id: str, day: date) -> dict:
+    """One-day statement as a record for shared/daily_balances.py (opening/closing wallet are real every day)."""
+    s = fetch_statement_summary(session, investor_id, day, day, quiet=True)
+    net_deposit = s["deposits"] - s["withdrawals"]
+    return {
+        "net_deposit": round(net_deposit, 2),
+        "value_change": round(net_deposit + s["interest_received"] + s["bonuses"] - s["fees"], 2),
+        "wallet_open": s["opening_balance"],
+        "wallet_close": s["closing_balance"],
+    }
+
+
+def get_daily_balances(
+    session: requests.Session, investor_id: str, monthly_summaries: dict, live_total: float, real_today: date,
+) -> DailyBalances | None:
+    """Day-by-day total/wallet/invested series since the first active month (see shared/daily_balances.py)."""
+    first_day = first_active_day(monthly_summaries)
+    if first_day is None:
+        return None
+    days = refresh_daily_cache(DAILY_STATE_FILE, lambda day: fetch_daily_record(session, investor_id, day), first_day, real_today)
+    return build_daily_balances(days, real_today, live_total)
+
+
 def run() -> None:
     if not LENDERMARKET_EMAIL or not LENDERMARKET_PASSWORD:
         log.error("LENDERMARKET_EMAIL and LENDERMARKET_PASSWORD environment variables are required.")
@@ -608,14 +648,12 @@ def run() -> None:
         sys.exit(1)
 
     try:
-        statement_totals = fetch_current_month_statement_totals(session, investor_id)
+        statement_totals = retry_call(
+            lambda: fetch_current_month_statement_totals(session, investor_id), "this month's statement totals"
+        )
     except Exception:
-        log.exception("Failed to fetch this month's interest received/bonuses - defaulting to 0.0.")
-        statement_totals = {
-            "interest_received": 0.0, "bonuses": 0.0, "fees": 0.0,
-            "opening_balance": 0.0, "closing_balance": 0.0, "deposits": 0.0, "withdrawals": 0.0,
-            "investment_amount": 0.0, "received_principal_amount": 0.0,
-        }
+        log.exception("Failed to fetch this month's interest received/bonuses - aborting rather than writing 0 to the Sheet.")
+        sys.exit(1)
 
     lenders = aggregate_by_lender(investments)
     log.info("Fetched %d active investment(s) across %d loan originator(s).", len(investments), len(lenders))
@@ -684,6 +722,16 @@ def run() -> None:
         log.exception("Failed to fetch the monthly statement summary history - XIRR will not be updated.")
         monthly_summaries = None
 
+    # Day-by-day balances/flows (real deposit dates, true daily averages); on any failure every figure below
+    # silently falls back to the monthly approximation.
+    daily_balances = None
+    if monthly_summaries and live_total_account_value is not None:
+        try:
+            daily_balances = get_daily_balances(session, investor_id, monthly_summaries, live_total_account_value, real_today)
+        except Exception:
+            log.exception("Failed to build the daily balances - falling back to the monthly approximation.")
+            daily_balances = None
+
     # Rows (months) after today_date's own month belong to a backfilled
     # month's future (real_today, not today_date) - excluded from every "as
     # of today_date" figure below via monthly_summaries_as_of; the full
@@ -737,8 +785,10 @@ def run() -> None:
                 value_change_since, closing_balance_as_of, total_invested,
             )
 
-        signed_cashflows = []
-        for month_key in sorted(monthly_summaries_as_of):
+        # Real-dated flows when the daily balances are available, else the monthly approximation (loop below).
+        signed_cashflows = daily_balances.cashflows(today_date) if daily_balances is not None else []
+        monthly_flow_keys = [] if daily_balances is not None else sorted(monthly_summaries_as_of)
+        for month_key in monthly_flow_keys:
             summary = monthly_summaries_as_of[month_key]
             net_deposit = summary["deposits"] - summary["withdrawals"]
             if abs(net_deposit) < 0.005:
@@ -838,6 +888,17 @@ def run() -> None:
             avg_invested_balance, invested_at_period_start, total_invested, net_new_investment, avg_non_invested_balance,
         )
 
+    if daily_balances is not None:
+        month_start = today_date.replace(day=1)
+        daily_invested = daily_balances.average("invested", month_start, today_date)
+        daily_wallet = daily_balances.average("wallet", month_start, today_date)
+        if daily_invested is not None and daily_wallet is not None:
+            avg_invested_balance, avg_non_invested_balance = daily_invested, daily_wallet
+            log.info(
+                "Solde moyen pondéré journalier (%s -> %s) - investi: %.2f EUR, non investi: %.2f EUR.",
+                month_start, today_date, avg_invested_balance, avg_non_invested_balance,
+            )
+
     # Cash drag/Rendements % brut's DENOMINATOR uses the PREVIOUS calendar
     # month's average balances, not this month's - added 2026-09-15.
     # Lendermarket pays interest with a one-month lag (a given month's
@@ -886,6 +947,17 @@ def run() -> None:
                 today_month_key,
             )
 
+    if daily_balances is not None:
+        prev_start, prev_end = previous_month_range(today_date)
+        daily_invested_prev = daily_balances.average("invested", prev_start, prev_end)
+        daily_wallet_prev = daily_balances.average("wallet", prev_start, prev_end)
+        if daily_invested_prev is not None and daily_wallet_prev is not None:
+            avg_invested_prev_month, avg_non_invested_prev_month = daily_invested_prev, daily_wallet_prev
+            log.info(
+                "Solde moyen pondéré journalier (mois N-1 %s -> %s, dénominateur du rendement) - investi: %.2f EUR, non investi: %.2f EUR.",
+                prev_start, prev_end, avg_invested_prev_month, avg_non_invested_prev_month,
+            )
+
     if avg_invested_prev_month is not None and avg_invested_prev_month > 0:
         cash_weight = avg_non_invested_prev_month / (avg_non_invested_prev_month + avg_invested_prev_month)
         monthly_yield_rate = statement_totals["interest_received"] / avg_invested_prev_month
@@ -932,6 +1004,11 @@ def run() -> None:
         avg_invested_lifetime = compute_average_invested(monthly_summaries_as_of, monthly_summaries, live_total_account_value)
         if avg_invested_lifetime is None or avg_invested_lifetime <= 0:
             avg_invested_lifetime = total_invested
+        if daily_balances is not None:
+            daily_idle_lifetime = daily_balances.average("wallet", daily_balances.inception_day, today_date)
+            daily_invested_lifetime = daily_balances.average("invested", daily_balances.inception_day, today_date)
+            if daily_idle_lifetime is not None and daily_invested_lifetime is not None and daily_invested_lifetime > 0:
+                avg_idle_cash_lifetime, avg_invested_lifetime = daily_idle_lifetime, daily_invested_lifetime
         cash_weight_lifetime = avg_idle_cash_lifetime / (avg_idle_cash_lifetime + avg_invested_lifetime)
         lifetime_gross_interest_total = sum(s["interest_received"] for s in monthly_summaries_as_of.values())
         lifetime_yield_rate = lifetime_gross_interest_total / avg_invested_lifetime
@@ -1045,15 +1122,17 @@ def run() -> None:
         try:
             rates = RateWeights()
             fill_remaining_duration_amounts(
-                "Lendermarket", aggregate_remaining_durations(investments, today_date, rates=rates), rates=rates
+                "Lendermarket", aggregate_remaining_durations(investments, today_date, rates=rates), rates=rates,
+                reclassify_buyback=False,
             )
         except Exception:
             log.exception("Failed to update the 'durée' sheet for Lendermarket.")
-
-        try:
-            fill_rate_amounts("Lendermarket", rates)
-        except Exception:
-            log.exception("Failed to update the 'taux' sheet for Lendermarket.")
+        else:
+            # Only when the durations were fetched: an empty `rates` would wipe the base-term rows of "taux".
+            try:
+                fill_rate_amounts("Lendermarket", rates)
+            except Exception:
+                log.exception("Failed to update the 'taux' sheet for Lendermarket.")
 
 
 if __name__ == "__main__":

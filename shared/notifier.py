@@ -300,6 +300,14 @@ def send_lendermarket_invest_summary_email(stats: dict, error: str | None = None
         })
 
     attachment = None
+    failed_context = [
+        {k: v for k, v in item.items() if k in ("label", "amount", "loan_uuid", "loan", "context")}
+        for item in stats.get("failed_attempts") or [] if item.get("loan") is not None
+    ]
+    if failed_context:
+        diagnostics_text = (diagnostics_text or "") + "\n\n=== Contexte des tentatives échouées (données marketplace du prêt) ===\n" + json.dumps(
+            failed_context, indent=2, default=str, ensure_ascii=False,
+        )
     if diagnostics_text:
         attachment = ("lendermarket_invest_bot_diagnostics_this_run.log", diagnostics_text)
     _send_invest_summary_email(
@@ -335,6 +343,30 @@ def send_afranga_invest_summary_email(stats: dict, error: str | None = None, dia
         attachment = ("afranga_invest_bot_diagnostics_this_run.log", diagnostics_text)
     _send_invest_summary_email(
         "Afranga", invested, failures=stats.get("failures", 0), error=error,
+        robot_config=robot_config, attachment=attachment, failed=stats.get("failed_attempts"),
+    )
+
+
+def send_income_marketplace_invest_summary_email(stats: dict, error: str | None = None, diagnostics_text: str | None = None, robot_config=None) -> None:
+    """Recap of monitors/income_marketplace_invest_bot.py (same email format
+    as the other invest bots). Only real purchases (`stats["invested"]`) are
+    listed; dry runs never buy anything, so they only get here on error."""
+    grouped = {}
+    for item in stats.get("invested") or []:
+        entry = grouped.setdefault(item["loan"], {"amount": 0.0, "rates": [], "amounts": []})
+        entry["amount"] += item["amount"]
+        entry["amounts"].append(item["amount"])
+        if item.get("rate") is not None:
+            entry["rates"].append(item["rate"])
+    invested = [
+        {"label": loan, "amount": entry["amount"], "rates": entry["rates"], "amounts": entry["amounts"]}
+        for loan, entry in grouped.items()
+    ]
+    attachment = None
+    if diagnostics_text:
+        attachment = ("income_marketplace_invest_bot_diagnostics_this_run.log", diagnostics_text)
+    _send_invest_summary_email(
+        "Income Marketplace", invested, failures=stats.get("failures", 0), error=error,
         robot_config=robot_config, attachment=attachment, failed=stats.get("failed_attempts"),
     )
 
@@ -797,6 +829,71 @@ def send_bilans_sync_issues_email(issues: list, error: str | None = None) -> Non
         log.info("Bilans sync issues email sent to %s.", EMAIL_TO)
     except Exception:
         log.exception("Failed to send bilans sync issues email.")
+
+
+def _send_plain_email(subject: str, body: str, label: str) -> None:
+    if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO]):
+        log.error(
+            "SMTP configuration is incomplete; cannot send email. "
+            "Required env vars: SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO."
+        )
+        return
+
+    msg = MIMEMultipart()
+    msg["From"] = EMAIL_FROM
+    msg["To"] = EMAIL_TO
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
+        log.info("%s email sent to %s.", label, EMAIL_TO)
+    except Exception:
+        log.exception("Failed to send %s email.", label)
+
+
+def send_plateformes_changes_email(added: list, removed: list, modified: list) -> None:
+    """Sent by scripts/sync_plateformes.py when the "plateformes" sheet content
+    changed. added / removed: row names. modified: dicts with name and changes
+    (list of (column, old, new))."""
+    subject = (f"[Plateformes] {len(added)} ajout(s), {len(modified)} modification(s), "
+               f"{len(removed)} suppression(s)")
+    body_lines = ["Changements détectés dans l'onglet \"plateformes\" :", ""]
+    if added:
+        body_lines.append(f"Ajouts ({len(added)}) :")
+        body_lines += [f"  - {name}" for name in added]
+        body_lines.append("")
+    if removed:
+        body_lines.append(f"Suppressions ({len(removed)}) :")
+        body_lines += [f"  - {name}" for name in removed]
+        body_lines.append("")
+    if modified:
+        body_lines.append(f"Modifications ({len(modified)}) :")
+        for item in modified:
+            body_lines.append(f"  {item['name']} :")
+            for column, old, new in item["changes"]:
+                body_lines.append(f"    - {column} : {old or '(vide)'} -> {new or '(vide)'}")
+        body_lines.append("")
+    _send_plain_email(subject, "\n".join(body_lines), "Plateformes changes")
+
+
+def send_plateformes_sync_issues_email(issues: list, error: str | None = None) -> None:
+    """Sent by scripts/sync_plateformes.py when the site data is inconsistent
+    (country mismatch, unmatched regulation entries...) or when the sync crashes."""
+    if error:
+        subject = "[Plateformes][ERREUR] Échec de la synchronisation des plateformes"
+    else:
+        subject = f"[Plateformes][ALERTE] {len(issues)} anomalie(s) dans les données du site"
+    body_lines = []
+    if error:
+        body_lines += ["La synchronisation a échoué :", error, ""]
+    if issues:
+        body_lines.append("Anomalies relevées sur liberte-financiere.net :")
+        body_lines += [f"- {i}" for i in issues]
+    _send_plain_email(subject, "\n".join(body_lines), "Plateformes sync issues")
 
 
 def send_missing_loans_email(platform: str, names: list, detail: str | None = None) -> None:

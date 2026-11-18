@@ -11,6 +11,8 @@ from google.oauth2.service_account import Credentials
 from gspread.utils import rowcol_to_a1
 
 from shared import duration_status_history as status_history
+from shared import remaining_duration
+from shared.amount_rounding import round_to_total
 from shared.remaining_duration import weighted_rate
 from shared.report_date import get_report_date
 
@@ -404,6 +406,9 @@ def fill_current_month_amounts(
         interest_row = platform_row + 1
 
     if skip_total:
+        if gross_interest_received is None:
+            logger.warning("Intérêts indisponibles et total ignoré : rien écrit pour %s.", platform)
+            return
         address = rowcol_to_a1(interest_row, current_month_col)
         logger.info(
             "skip_total=True (mois non courant) : écriture uniquement des intérêts = %s (%s), total ignoré",
@@ -426,14 +431,13 @@ def fill_current_month_amounts(
         platform, total_amount, total_a1, gross_interest_received, interest_a1,
     )
 
-    _call_with_retry(
-        worksheet.batch_update,
-        [
-            {"range": total_a1, "values": [[total_amount]]},
-            {"range": interest_a1, "values": [[gross_interest_received]]},
-        ],
-        value_input_option="USER_ENTERED"
-    )
+    updates = [{"range": total_a1, "values": [[total_amount]]}]
+    if gross_interest_received is None:
+        logger.warning("Intérêts indisponibles pour %s : cellule %s laissée intacte.", platform, interest_a1)
+    else:
+        updates.append({"range": interest_a1, "values": [[gross_interest_received]]})
+
+    _call_with_retry(worksheet.batch_update, updates, value_input_option="USER_ENTERED")
 
     logger.info("Mise à jour terminée pour %s (total %s, intérêts %s)", platform, total_a1, interest_a1)
 
@@ -1055,14 +1059,27 @@ def fill_geographic_repartition_amounts(loan_originators: list, platform: str | 
         # Ligne existante sans aucun montant par pays (ex. société ajoutée
         # automatiquement avant que le pays soit géré) : on le renseigne.
         country_col = _geo_country_column_of(grid, geo_row, geo_col, lo.get("country"))
-        if country_col:
-            current_row = grid[row - 1]
-            has_country_amount = any(
-                cell.strip() for cell in current_row[geo_col + 1:]
-            )
-            if not has_country_amount:
+        current_row = grid[row - 1]
+        filled_country_cells = [
+            (col_idx, _parse_french_amount(cell))
+            for col_idx, cell in enumerate(current_row, start=1)
+            if col_idx > geo_col + 1 and cell.strip()
+        ]
+        if country_col and not filled_country_cells:
+            updates.append({
+                "range": rowcol_to_a1(row, country_col),
+                "values": [[f"=${_col_letter(target_col)}{row}"]],
+            })
+        elif len(filled_country_cells) == 1:
+            # Un montant pays saisi à la main qui n'a pas suivi le total de la société fausse la somme par plateforme.
+            filled_col, filled_amount = filled_country_cells[0]
+            if filled_amount is not None and abs(filled_amount - float(amount)) > 0.005:
+                logger.warning(
+                    "'%s' : montant pays (%s) != total (%s) - recalé sur le total.",
+                    lo["name"], filled_amount, amount,
+                )
                 updates.append({
-                    "range": rowcol_to_a1(row, country_col),
+                    "range": rowcol_to_a1(row, filled_col),
                     "values": [[f"=${_col_letter(target_col)}{row}"]],
                 })
 
@@ -1097,16 +1114,17 @@ def fill_geographic_repartition_amounts(loan_originators: list, platform: str | 
 
 DURATION_SHEET_NAME = "durée"
 _DURATION_LABEL_RE = re.compile(
-    r"^(?:(\d+)\s*ans?)?\s*(?:(\d+)\s*mois)?\s*(?:(\d+)\s*jours?)?\s*(de\s+retard|de\s+d[ée]faut)?$", re.IGNORECASE
+    r"^(?:(\d+)\s*ans?)?\s*(?:(\d+)\s*mois)?\s*(?:(\d+)\s*jours?)?\s*(de\s+retard|de\s+d[ée]faut|de\s+buyback)?$", re.IGNORECASE
 )
 
 
 def _duration_label(term: tuple) -> str:
     """(mois, jours) -> "2 ans 8 mois 29 jours" / "1 an" / "5 jours" / "0 jour".
     Un terme négatif (prêt en retard) donne "2 mois 5 jours de retard" ;
-    (mois, jours, "default") (prêt en défaut) donne "2 mois 5 jours de défaut"."""
+    (mois, jours, "buyback") (prêt en retard depuis au moins le délai de buyback de sa société) donne
+    "2 mois 5 jours de buyback" ; (mois, jours, "default") (prêt en défaut) donne "2 mois 5 jours de défaut"."""
     months, days = term[0], term[1]
-    in_default = len(term) > 2
+    marker = term[2] if len(term) > 2 else None
     late = months < 0 or days < 0
     months, days = abs(months), abs(days)
     years, months = divmod(months, 12)
@@ -1117,7 +1135,9 @@ def _duration_label(term: tuple) -> str:
         parts.append(f"{months} mois")
     if days or not (years or months):
         parts.append(f"{days} jour" + ("s" if days > 1 else ""))
-    if in_default:
+    if marker == "buyback":
+        parts.append("de buyback")
+    elif marker:
         parts.append("de défaut")
     elif late:
         parts.append("de retard")
@@ -1132,6 +1152,8 @@ def _parse_duration_label(label: str):
     suffix = (match.group(4) or "").casefold()
     months = int(match.group(1) or 0) * 12 + int(match.group(2) or 0)
     days = int(match.group(3) or 0)
+    if "buyback" in suffix:
+        return (months, days, "buyback")
     if "faut" in suffix:
         return (months, days, "default")
     sign = -1 if suffix else 1
@@ -1139,15 +1161,15 @@ def _parse_duration_label(label: str):
 
 
 def _duration_sort_key(term: tuple):
-    """Défauts d'abord (le plus ancien en premier), puis retards, puis durées restantes croissantes."""
+    """Défauts d'abord (le plus ancien en premier), puis buybacks (idem), puis retards, puis durées restantes croissantes."""
     if len(term) > 2:
-        return (0, -term[0], -term[1])
-    return (1, term[0], term[1])
+        return (1 if term[2] == "buyback" else 0, -term[0], -term[1])
+    return (2, term[0], term[1])
 
 
 def _problem_priority(durations: dict):
-    """Clé de tri d'une société ayant au moins un prêt en défaut ou en retard (None sinon) : défauts
-    avant retards, la plus grosse durée de défaut/retard en premier."""
+    """Clé de tri d'une société ayant au moins un prêt en défaut, en buyback ou en retard (None sinon) : défauts
+    avant buybacks avant retards, la plus grosse durée de défaut/buyback/retard en premier."""
     keys = [_duration_sort_key(term) for term in durations if len(term) > 2 or term[0] < 0 or term[1] < 0]
     return min(keys) if keys else None
 
@@ -1166,9 +1188,9 @@ _DURATION_AMOUNT_FORMAT = {
 }
 
 
-_DURATION_STATUS_LABELS = ("normaux", "retards", "défauts")  # même ordre que les parts (normal, retard, défaut)
-_DURATION_STATUS_DISPLAY_ORDER = ("défauts", "retards", "normaux")
-_DURATION_STATUS_BY_CLASS = {"default": "défauts", "late": "retards", "normal": "normaux"}
+_DURATION_STATUS_LABELS = ("normaux", "retards", "défauts", "buyback")  # même ordre que les parts moyennes (normal, retard, défaut, buyback)
+_DURATION_STATUS_DISPLAY_ORDER = ("défauts", "buyback", "retards", "normaux")
+_DURATION_STATUS_BY_CLASS = {"default": "défauts", "buyback": "buyback", "late": "retards", "normal": "normaux"}
 _DURATION_SECTION_LABELS = ("crowdlending", "crowdlending savings", "crowdlending agricole", "crowdfunding immobilier")
 # Colonnes (index 0-based) : A = société de prêt / statut / projet, B = durée, C = rendement (%),
 # D = montant, E... = mois (mois courant à gauche, les mois passés sont à droite).
@@ -1262,6 +1284,82 @@ def _duration_horizon_months(sections: list, platform_row: int, log_problem: boo
     return status_history.DEFAULT_HORIZON_MONTHS
 
 
+# Délai de buyback d'une société de prêt = nombre de jours de retard à partir duquel un de ses prêts passe de
+# "retard" à "buyback" (le prêteur ou la plateforme rachète alors le prêt). Il est saisi en colonne D de la ligne de
+# la société dans l'onglet "durée" ("2 mois", "8 mois", "2 mois 15 jours" ; vide = pas de buyback) et modifiable depuis la vue "Durées" de la
+# page CarteDetailPage. Aucune valeur par défaut dans le code : sans délai dans l'onglet (cellule vide, société ou
+# onglet absents/illisibles), il n'y a pas de buyback.
+_DURATION_BUYBACK_COL = _DURATION_AMOUNT_COL
+# Plateformes dont l'API indique elle-même le buyback : pas de délai configurable (colonne D laissée vide, ignorée si remplie).
+# Income Marketplace : statut de prêt "Buyback initiated" (prêt toujours en encours). Nectaro : statut "BUYBACK" de chaque prêt
+# Income Marketplace : statut de prêt "Buyback initiated" (prêt toujours en encours). Nectaro : statut "BUYBACK" de chaque prêt
+# sous-jacent, qui sort alors de l'encours (jamais de montant en buyback à afficher).
+API_BUYBACK_PLATFORMS = frozenset({"income marketplace", "nectaro"})
+
+
+def _duration_block_bounds(grid: list, platform: str):
+    """(ligne 1-based de la plateforme, 1re ligne 1-based après son bloc) ; None si la plateforme n'est pas dans l'onglet."""
+    def name(row_idx: int) -> str:
+        row = grid[row_idx - 1]
+        return row[0].strip().casefold() if row else ""
+
+    platform_row = next((i for i in range(1, len(grid) + 1) if name(i) == platform.strip().casefold()), None)
+    if platform_row is None:
+        return None
+    boundaries = {label.casefold() for label in GEO_SECTION_BOUNDARY_LABELS} | {"crowdlending"}
+    boundaries.discard(platform.strip().casefold())
+    end_row = platform_row + 1
+    while end_row <= len(grid) and name(end_row) not in boundaries:
+        end_row += 1
+    return platform_row, end_row
+
+
+def _duration_originator_buyback_texts(grid: list, platform_row: int, end_row: int) -> dict:
+    """{société (casse ignorée): texte de la colonne D de sa ligne} des lignes de société du bloc de la plateforme
+    (les lignes de statut et de durée sont ignorées)."""
+    texts = {}
+    for row in grid[platform_row:end_row - 1]:
+        name = row[0].strip() if row else ""
+        label = row[_DURATION_LABEL_COL].strip() if len(row) > _DURATION_LABEL_COL else ""
+        if not name or name.casefold() in _DURATION_STATUS_LABELS:
+            continue
+        if _parse_duration_label(label) is not None or _parse_duration_label(name) is not None:
+            continue
+        texts[name.casefold()] = row[_DURATION_BUYBACK_COL].strip() if len(row) > _DURATION_BUYBACK_COL else ""
+    return texts
+
+
+_buyback_days_cache: dict = {}  # plateforme (casse ignorée) -> {société: jours ou None}, None si l'onglet était illisible
+
+
+def buyback_days_for(platform: str, originator: str):
+    """Délai de buyback (jours) de la société `originator` de `platform`, lu dans l'onglet "durée" (une seule lecture
+    par plateforme et par processus) ; None si elle n'en a pas (cellule vide, société sans ligne ou onglet illisible)."""
+    cache_key = platform.strip().casefold()
+    if cache_key in API_BUYBACK_PLATFORMS:
+        return None
+    if cache_key not in _buyback_days_cache:
+        try:
+            grid = _call_with_retry(get_worksheet_by_name(DURATION_SHEET_NAME).get_all_values)
+            bounds = _duration_block_bounds(grid, platform)
+            texts = _duration_originator_buyback_texts(grid, *bounds) if bounds else {}
+            _buyback_days_cache[cache_key] = {key: status_history.parse_buyback_days(text) for key, text in texts.items()}
+        except Exception as exc:
+            logger.warning("Délais de buyback de %s illisibles dans '%s' (%s) - aucun buyback appliqué.", platform, DURATION_SHEET_NAME, exc)
+            _buyback_days_cache[cache_key] = None
+    days_by_originator = _buyback_days_cache[cache_key]
+    key = str(originator or "").strip().casefold()
+    if days_by_originator is not None and key in days_by_originator:
+        return days_by_originator[key]
+    return None
+
+
+def default_after_late_days(platform: str, originator: str) -> int:
+    """Jours de retard au-delà desquels un prêt encore impayé est supposé en défaut : le délai de buyback de la société
+    (60 jours sans délai configuré) + 30 jours (voir shared.remaining_duration.default_after_late_days)."""
+    return remaining_duration.default_after_late_days(buyback_days_for(platform, originator))
+
+
 def _duration_status_requests(worksheet, grid, platform, platform_row, end_row, desired, new_data, platform_level, row_range) -> list:
     """Requêtes batchUpdate gérant les colonnes de mois (partagées par tous les secteurs, mois courant à gauche)
     et, sur les lignes "normaux"/"retards"/"défauts" de `desired`, la moyenne mensuelle des parts (%), pondérée
@@ -1288,8 +1386,8 @@ def _duration_status_requests(worksheet, grid, platform, platform_row, end_row, 
     def display(history_key: str) -> str:
         return "ensemble de la plateforme" if history_key == status_history.PLATFORM_KEY else names.get(history_key, history_key)
 
-    def percents(shares) -> str:
-        return "défauts %.2f%% | retards %.2f%% | normaux %.2f%%" % (shares[2] * 100, shares[1] * 100, shares[0] * 100)
+    def percents(normal, late, default, buyback) -> str:
+        return "défauts %.2f%% | buyback %.2f%% | retards %.2f%% | normaux %.2f%%" % (default * 100, buyback * 100, late * 100, normal * 100)
 
     path = status_history.state_path(platform)
     days, names, runs = status_history.load_history(path)
@@ -1297,7 +1395,7 @@ def _duration_status_requests(worksheet, grid, platform, platform_row, end_row, 
     status_history.record_day(days, names, runs, today, shares_by_key, names_by_key, today, horizon_months)
     status_history.save_history(path, days, names, runs)
     for history_key, shares in shares_by_key.items():
-        logger.info("[%s] %s - parts du jour %s enregistrées dans %s : %s", platform, display(history_key), today, path.name, percents(shares))
+        logger.info("[%s] %s - parts du jour %s enregistrées dans %s : %s", platform, display(history_key), today, path.name, percents(*shares[:3], status_history.buyback_share(shares)))
     if not shares_by_key:
         logger.info("[%s] aucun prêt en cours le %s : rien d'enregistré pour ce jour dans %s.", platform, today, path.name)
 
@@ -1313,8 +1411,8 @@ def _duration_status_requests(worksheet, grid, platform, platform_row, end_row, 
         samples = status_history.monthly_samples(days, history_key, *month)
         logger.info(
             "[%s] %s - moyenne de %s sur %s jour(s) : %s. Jours utilisés : %s",
-            platform, display(history_key), status_history.month_label(*month), len(samples), percents(average),
-            "; ".join(f"{day} ({percents(shares)})" for day, shares in samples),
+            platform, display(history_key), status_history.month_label(*month), len(samples), percents(*average),
+            "; ".join(f"{day} ({percents(*shares[:3], status_history.buyback_share(shares))})" for day, shares in samples),
         )
     needed = {month for (_, month), average in averages.items() if average is not None}
 
@@ -1395,19 +1493,22 @@ def _duration_status_requests(worksheet, grid, platform, platform_row, end_row, 
 
 def fill_remaining_duration_amounts(
     platform: str, durations_by_originator: dict, platform_level: bool = False, projects: bool = False, rates=None,
+    target_totals: dict | None = None, reclassify_buyback: bool = True,
 ):
     """Synchronise le bloc de la plateforme `platform` (ligne dont la
     colonne A vaut exactement son nom) dans l'onglet "durée" :
 
-    - une ligne par société de prêt (nom en colonne A, montant vide), créée
+    - une ligne par société de prêt (nom en colonne A, délai de buyback en colonne D - "2 mois", vide = pas de buyback,
+      conservé tel quel ; vide à la création), créée
       si absente et supprimée seulement quand elle n'a plus de prêt ET plus aucune donnée
       dans l'historique de l'horizon (une société sans prêt en cours garde sa ligne et ses lignes de statut) ;
-    - sous chacune, trois lignes "défauts", "retards", "normaux" (dans cet ordre) portant, à
+    - sous chacune, les lignes "défauts", "buyback", "retards", "normaux" (dans cet ordre ; "buyback" seulement pour une
+      société ayant un délai de buyback, voir ci-dessous) portant, à
       partir de la colonne E, la moyenne mensuelle (un mois par colonne, le mois
       courant à gauche, sur l'horizon du secteur de la plateforme lu en colonne D de la ligne du
       secteur, voir shared.duration_status_history) de la part de chaque statut dans
       l'encours de la société ;
-    - sous chacune de ces trois lignes, ses lignes de durée restante ("32 mois 29 jours", "5
+    - sous chacune de ces lignes de statut, ses lignes de durée restante ("32 mois 29 jours", "5
       jours"...) par durée (triées par durée croissante, créée/supprimée de
       la même façon), la durée en colonne B, le rendement (%) en colonne C et le montant correspondant en
       colonne D. La colonne A de ces lignes reste vide pour une société de prêt, et porte le nom du projet pour
@@ -1420,6 +1521,8 @@ def fill_remaining_duration_amounts(
     `durations_by_originator` : {société de prêt: {(mois, jours): montant}},
     ex. {"Société A": {(24, 0): 1000.0, (5, 12): 500.0}}. Un terme négatif
     (mois, jours) = prêt en retard, libellé "2 mois 5 jours de retard" ; un terme
+    (mois, jours, "buyback") = prêt en retard depuis au moins le délai de buyback de sa société, libellé
+    "2 mois 5 jours de buyback" (les termes en retard sont reclassés ainsi ici, selon ce délai) ; un terme
     (mois, jours, "default") = prêt en défaut, libellé "2 mois 5 jours de défaut". Les lignes déjà présentes et
     toujours valides sont conservées (leur ordre aussi), seules les lignes
     manquantes/périmées (y compris les lignes à nom vide) sont insérées/supprimées.
@@ -1428,6 +1531,11 @@ def fill_remaining_duration_amounts(
     calculée sur tout son encours, et `durations_by_originator` regroupe ses prêts par clé quelconque.
     `projects` (avec `platform_level`) : ces clés sont des noms de projets, écrits en colonne A de chaque ligne
     de durée (sinon la colonne A de ces lignes reste vide).
+    `target_totals` : {société de prêt (casse et espaces ignorés) : montant total} - (None pour une plateforme
+    `platform_level`) ; les montants arrondis au centime de ses lignes somment alors exactement à ce total (le
+    montant affiché dans l'onglet "répartition géographique"). Sans total connu, la somme des prêts fait foi.
+    `reclassify_buyback` : False quand la plateforme pose elle-même les termes (mois, jours, "buyback") (délai de
+    buyback compté depuis autre chose que le retard du terme, ex. Lendermarket) ; les termes en retard restent alors tels quels.
         Le bloc s'arrête à la prochaine plateforme/section ou à la fin de la feuille.
     """
     worksheet = get_worksheet_by_name(DURATION_SHEET_NAME)
@@ -1513,6 +1621,10 @@ def fill_remaining_duration_amounts(
     project_names = {"": ""}
     amounts_by_term = {}
     rate_entries = {}  # (clé société, terme, clé projet) -> [RateWeights.entry(), ...]
+    buyback_days_by_key = {}  # clé société -> délai de buyback en jours (None = pas de buyback)
+    buyback_texts = {}  # clé société -> texte écrit en colonne D de sa ligne
+    rate_terms = {}  # (clé société, terme reclassé en buyback) -> terme d'origine, sous lequel `rates` a rangé son taux
+    history_days = {}  # historique des parts journalières (voir shared.duration_status_history.load_history)
     if platform_level:
         # Plateforme sans société de prêt : un seul bloc (clé None) regroupant tous les prêts, sans ligne de société.
         merged = {}
@@ -1522,7 +1634,7 @@ def fill_remaining_duration_amounts(
             project_names.setdefault(project_key, project.strip())
             for term, amount in durations.items():
                 project_amounts = by_term.setdefault(term, {})
-                project_amounts[project_key] = round(project_amounts.get(project_key, 0.0) + float(amount), 2)
+                project_amounts[project_key] = project_amounts.get(project_key, 0.0) + float(amount)
                 merged[term] = round(merged.get(term, 0.0) + float(amount), 2)
         new_data = {None: (platform, merged)}
         amounts_by_term[None] = by_term
@@ -1536,6 +1648,7 @@ def fill_remaining_duration_amounts(
         # de l'horizon contient des données pour elle.
         horizon_months = _duration_horizon_months(_duration_sections(grid), platform_row)
         tracked = status_history.tracked_originators(status_history.state_path(platform), get_report_date(), horizon_months)
+        history_days = status_history.load_history(status_history.state_path(platform))[0]
         new_data = {}
         for name, durations in durations_by_originator.items():
             key = originator_key(name)
@@ -1543,11 +1656,49 @@ def fill_remaining_duration_amounts(
                 new_data[key] = (name.strip(), durations or {})
         for key, name in tracked.items():
             new_data.setdefault(key, (name, {}))
+        # Délai de buyback de chaque société : celui de sa ligne (modifiable dans l'onglet ou la page CarteDetailPage),
+        # sinon la valeur par défaut pour une nouvelle société. Un prêt en retard depuis au moins ce délai passe de
+        # "retard" à "buyback".
+        existing_buyback_texts = _duration_originator_buyback_texts(grid, platform_row, end_row)
+        report_date = get_report_date()
+        for key, (name, durations) in list(new_data.items()):
+            if platform.strip().casefold() in API_BUYBACK_PLATFORMS:
+                buyback_texts[key] = ""
+                days = None
+            elif key in existing_buyback_texts:
+                buyback_texts[key] = existing_buyback_texts[key]
+                days = status_history.parse_buyback_days(buyback_texts[key])
+                if buyback_texts[key] and days is None:
+                    logger.warning(
+                        "Délai de buyback illisible dans '%s'!%s%s (%r) - ignoré. Attendu : '60 jours', '2 mois'...",
+                        DURATION_SHEET_NAME, _col_letter(_DURATION_BUYBACK_COL + 1), platform_row, buyback_texts[key],
+                    )
+            else:
+                days = None
+                buyback_texts[key] = ""
+            buyback_days_by_key[key] = days
+            if not days or not reclassify_buyback:
+                continue
+            converted = {}
+            for term, amount in durations.items():
+                new_term = remaining_duration.to_buyback_term(report_date, term, days)
+                converted[new_term] = converted.get(new_term, 0.0) + float(amount)
+                if new_term != term:
+                    rate_terms[(key, new_term)] = term
+            new_data[key] = (name, converted)
         for key, (_, durations) in new_data.items():
             amounts_by_term[key] = {term: {"": amount} for term, amount in durations.items()}
             if rates is not None:
                 for term in durations:
-                    rate_entries[(key, term, "")] = [rates.entry(key, term)]
+                    rate_entries[(key, term, "")] = [rates.entry(key, rate_terms.get((key, term), term))]
+    # Arrondi au centime des montants de chaque société, sans que la somme de ses lignes dérive du total voulu.
+    targets = {None if key is None else originator_key(key): total for key, total in (target_totals or {}).items()}
+    for key, by_term in amounts_by_term.items():
+        leaves = {(term, project_key): amount for term, projects_ in by_term.items() for project_key, amount in projects_.items()}
+        rounded = {}
+        for (term, project_key), amount in round_to_total(leaves, targets.get(key)).items():
+            rounded.setdefault(term, {})[project_key] = amount
+        amounts_by_term[key] = rounded
     existing_order = [key for kind, key, _, _ in existing if kind == "orig" and key in new_data]
     existing_order = list(dict.fromkeys(existing_order))
     new_keys = sorted(
@@ -1570,8 +1721,17 @@ def fill_remaining_duration_amounts(
         if not platform_level:
             desired.append(("orig", key, key))
             desired_texts[("orig", key, key)] = (name, "")
-        # Pour chaque statut (défauts, retards, normaux) : sa ligne de part (%) puis ses lignes de durée.
+        # Pour chaque statut (défauts, buyback, retards, normaux) : sa ligne de part (%) puis ses lignes de durée.
+        # La ligne "buyback" n'existe que pour une société ayant un délai de buyback, un prêt en buyback ou du buyback
+        # dans son historique (pour que son % des mois passés ne disparaisse pas dès que ses prêts en buyback sont remboursés).
+        has_buyback = (
+            bool(buyback_days_by_key.get(key))
+            or any(status_history.classify_term(term) == "buyback" for term in durations)
+            or any(key in shares and status_history.buyback_share(shares[key]) > 0 for shares in history_days.values())
+        )
         for status_label in _DURATION_STATUS_DISPLAY_ORDER:
+            if status_label == "buyback" and not has_buyback:
+                continue
             desired.append(("status", key, status_label))
             desired_texts[("status", key, status_label)] = (status_label, "")
             for term in sorted(durations, key=_duration_sort_key):
@@ -1700,7 +1860,9 @@ def fill_remaining_duration_amounts(
             }
             amount_rows.append({"values": [rate_cell, amount_cell]})
         else:
-            amount_rows.append({"values": [{}, {}]})
+            # Ligne de société : le délai de buyback est écrit en colonne D (les autres lignes de statut restent vides).
+            text = buyback_texts.get(item[1], "") if item[0] == "orig" else ""
+            amount_rows.append({"values": [{}, {"userEnteredValue": {"stringValue": text}} if text else {}]})
     if amount_rows:
         requests.append({"updateCells": {
             "range": row_range(platform_row + 1, platform_row + len(desired), _DURATION_RATE_COL, _DURATION_AMOUNT_COL + 1),

@@ -186,11 +186,13 @@ from shared.google_sheet import (
     fill_geographic_repartition_amounts,
     fill_geographic_repartition_uninvested_amount,
     fill_remaining_duration_amounts,
+    default_after_late_days,
 )
 from shared.rate_sheet import fill_rate_amounts
-from shared.remaining_duration import DEFAULT_AFTER_LATE_DAYS, RateWeights, base_term_between, base_term_from_days, overdue_months_and_days, remaining_months_and_days
+from shared.remaining_duration import RateWeights, base_term_between, base_term_from_days, overdue_months_and_days, remaining_months_and_days
 from shared.report_date import get_report_now, is_current_month
-from shared.session_cache import get_or_refresh_session
+from shared.retry import retry_call
+from shared.session_cache import get_or_refresh_session, save_session_state
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
 from shared.monthly_yield_waterfall import compute_monthly_yield_shares
@@ -208,7 +210,6 @@ INVESTMENTS_API_URL = "https://api.peerberry.com/v1/investor/investments"
 LOANS_API_URL = "https://api.peerberry.com/v1/loans"
 # Server caps pageSize at 40 (verified live 2026-10-16: 100 -> 422 "Page Size must be no greater than 40").
 INVESTMENTS_PAGE_SIZE = 40
-MAX_INVESTMENTS_PAGES = 50
 # PeerBerry only exposes CURRENT/LATE statuses (no default status): a loan late by more than the shared
 # DEFAULT_AFTER_LATE_DAYS (buyback trigger + grace period) is treated as in default in the "durée" tab (inferred).
 # The Account Summary page's default "This month" period (verified 2026-07-10
@@ -237,7 +238,6 @@ XIRR_HISTORY_START_DATE = "2000-01-01"
 # safety net (with real offset-based pagination below regardless) for
 # accounts with more history than this one.
 TRANSACTIONS_PAGE_SIZE = 1000
-MAX_TRANSACTIONS_PAGES = 50
 
 
 def fetch_originator_distribution(session: requests.Session) -> list:
@@ -281,6 +281,17 @@ def normalize_originators(payload: list) -> list:
     return originators
 
 
+def _get_with_relogin(session: requests.Session, url: str, **kwargs) -> requests.Response:
+    """GET `url`; on a 401 (token expired/invalidated mid-run) log in again once and retry."""
+    r = session.get(url, headers=_HEADERS, timeout=20, **kwargs)
+    if r.status_code == 401:
+        log.warning("PeerBerry API returned 401 for %s - logging in again and retrying once.", url)
+        login(session)
+        save_session_state(session, SESSION_STATE_FILE)
+        r = session.get(url, headers=_HEADERS, timeout=20, **kwargs)
+    return r
+
+
 def fetch_current_investments(session: requests.Session) -> list:
     """Fetch every current investment (the "My investments" list, `type=CURRENT`, late ones included).
 
@@ -290,12 +301,13 @@ def fetch_current_investments(session: requests.Session) -> list:
     "nextPaymentDate": "2026-10-16", "finalPaymentDate": "2026-10-12", ...}`. `type` only accepts CURRENT/FINISHED."""
     investments = []
     offset = 0
-    for page_number in range(1, MAX_INVESTMENTS_PAGES + 1):
-        r = session.get(
+    page_number = 0
+    while True:
+        page_number += 1
+        r = _get_with_relogin(
+            session,
             INVESTMENTS_API_URL,
             params={"type": "CURRENT", "offset": offset, "pageSize": INVESTMENTS_PAGE_SIZE},
-            headers=_HEADERS,
-            timeout=20,
         )
         if not r.ok:
             raise RuntimeError(f"Investments API returned status {r.status_code} (offset={offset})")
@@ -305,8 +317,6 @@ def fetch_current_investments(session: requests.Session) -> list:
         if len(page) < INVESTMENTS_PAGE_SIZE:
             break
         offset += INVESTMENTS_PAGE_SIZE
-    else:
-        log.warning("Hit MAX_INVESTMENTS_PAGES (%d) without exhausting the investments - the list may be incomplete.", MAX_INVESTMENTS_PAGES)
     return investments
 
 
@@ -332,7 +342,7 @@ def fetch_loan_base_terms(session: requests.Session, investments: list) -> dict:
         if loan_id is None:
             continue
         try:
-            r = session.get(f"{LOANS_API_URL}/{loan_id}", headers=_HEADERS, timeout=20)
+            r = _get_with_relogin(session, f"{LOANS_API_URL}/{loan_id}")
             r.raise_for_status()
             loan = (r.json() or {}).get("loan") or {}
             term = base_term_from_days(loan.get("initialTerm")) or base_term_between(
@@ -380,7 +390,7 @@ def aggregate_remaining_durations(investments: list, today: date, rates: RateWei
             due_dates = [d for d in (maturity, _parse_iso_date(inv.get("nextPaymentDate"))) if d and d < today]
             if due_dates:
                 due = min(due_dates)
-                term = overdue_months_and_days(today, due, default=(today - due).days > DEFAULT_AFTER_LATE_DAYS)
+                term = overdue_months_and_days(today, due, default=(today - due).days > default_after_late_days("Peerberry", originator))
             else:
                 log.warning("Late investment of %s (%.2f EUR) has no past due date - using its remaining term.", originator, amount)
         if term is None:
@@ -479,9 +489,10 @@ def fetch_transactions_page(session: requests.Session, start_date: str, end_date
 
 def fetch_all_transactions(session: requests.Session, start_date: str, end_date: str) -> list:
     """Fetch EVERY transaction row within [start_date, end_date], paginated
-    via TRANSACTIONS_PAGE_SIZE/MAX_TRANSACTIONS_PAGES - the endpoint has no
-    total-count field, so pagination stops as soon as a page comes back
-    shorter than the requested pageSize (or empty).
+    via offsets - the endpoint has no
+    total-count field, so pagination stops only when a page comes back empty
+    (not when it is merely shorter than TRANSACTIONS_PAGE_SIZE, so a
+    server-side cap on pageSize can't silently truncate the history).
 
     BUGFIX 2026-08-21: refuse to call the API at all when start_date is
     AFTER end_date - PeerBerry's API returns a 422 for an inverted range
@@ -500,16 +511,20 @@ def fetch_all_transactions(session: requests.Session, start_date: str, end_date:
 
     entries = []
     offset = 0
-    for page_number in range(1, MAX_TRANSACTIONS_PAGES + 1):
+    previous_page = None
+    page_number = 0
+    while True:
+        page_number += 1
         log.info("Requesting transactions API at offset %d...", offset)
         page_entries = fetch_transactions_page(session, start_date, end_date, offset, TRANSACTIONS_PAGE_SIZE)
         log.info("Page %d: %d entrie(s) found.", page_number, len(page_entries))
-        entries.extend(page_entries)
-        if len(page_entries) < TRANSACTIONS_PAGE_SIZE:
+        if not page_entries:
             break
-        offset += TRANSACTIONS_PAGE_SIZE
-    else:
-        log.warning("Hit MAX_TRANSACTIONS_PAGES (%d) without exhausting the transaction history - it may be incomplete.", MAX_TRANSACTIONS_PAGES)
+        if page_entries == previous_page:
+            raise RuntimeError(f"Transactions pagination is not advancing (offset {offset} repeats the previous page).")
+        previous_page = page_entries
+        entries.extend(page_entries)
+        offset += len(page_entries)
     return entries
 
 
@@ -1056,10 +1071,10 @@ def run() -> None:
         sys.exit(1)
 
     try:
-        statement_totals = fetch_current_month_statement_totals(session)
+        statement_totals = retry_call(lambda: fetch_current_month_statement_totals(session), "this month's statement totals")
     except Exception:
-        log.exception("Failed to fetch this month's Interest income - defaulting to 0.0.")
-        statement_totals = {"interest_income": 0.0, "opening_balance": 0.0, "closing_balance": 0.0}
+        log.exception("Failed to fetch this month's Interest income - aborting rather than writing 0 to the Sheet.")
+        sys.exit(1)
     interest_income = statement_totals["interest_income"]
 
     originators = normalize_originators(payload)
@@ -1469,12 +1484,13 @@ def run() -> None:
             )
         except Exception:
             log.exception("Failed to update the 'durée' sheet for Peerberry.")
-
-        # Own try/except too: the "taux" tab is independent of the "durée" one.
-        try:
-            fill_rate_amounts("Peerberry", rates)
-        except Exception:
-            log.exception("Failed to update the 'taux' sheet for Peerberry.")
+        else:
+            # Only when the durations were fetched: an empty `rates` (e.g. API 401)
+            # would make fill_rate_amounts wipe the base-term rows of "taux".
+            try:
+                fill_rate_amounts("Peerberry", rates)
+            except Exception:
+                log.exception("Failed to update the 'taux' sheet for Peerberry.")
 
 
 if __name__ == "__main__":

@@ -94,6 +94,7 @@ LENDERMARKET_CRON_JOB_ID = os.environ.get("LENDERMARKET_CRON_JOB_ID")
 API_BASE = "https://api.lendermarket.com"
 CSRF_URL = f"{API_BASE}/users/v1/auth/getCsrfToken"
 LOGIN_URL = f"{API_BASE}/users/v1/auth/login"
+_LOGIN_MAX_ATTEMPTS = 3
 TOTP_URL = f"{API_BASE}/users/v1/auth/submitTotpChallenge"
 LOANS_API_URL = f"{API_BASE}/claims/v1/public/getActiveLoans"
 BALANCE_API_URL = f"{API_BASE}/ledger/v1/investor/getInvestorAccountSummary"
@@ -116,6 +117,10 @@ INVEST_DIAGNOSTICS_FILE = Path(__file__).parent / "lendermarket_invest_diagnosti
 # investment, confirmed by the user 2026-07-24.
 MIN_INVESTMENT_AMOUNT = float(os.environ.get("LENDERMARKET_MIN_INVESTMENT_AMOUNT", "10"))
 
+# "dry" (selected through the workflow's manual-run "mode" input) plans the
+# investments but buys nothing; scheduled runs are always "live".
+DRY_RUN = os.environ.get("LENDERMARKET_BOT_MODE", "live").strip().lower() == "dry"
+
 _HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Referer": "https://app.lendermarket.com/",
@@ -134,7 +139,6 @@ DEFAULT_STATE = {
 INVEST_MIN_REMAINING_TERM_IN_DAYS = 1
 INVEST_MAX_REMAINING_TERM_IN_DAYS = 360
 INVEST_REGULATION_STATUSES = ("REGULATED", "UNREGULATED")
-MAX_LOANS_PAGES = 100
 # Whole-marketplace scan (many pages) at most this often, only triggered by a
 # sheet name matching no known lender.
 LENDER_SCAN_INTERVAL_SECONDS = 30 * 60
@@ -158,7 +162,9 @@ def fetch_marketplace_loans(
     rate bounds are checked per lender by plan_allocations()). Returns None
     if the API could not be read completely."""
     loans, seen = [], set()
-    for page in range(1, MAX_LOANS_PAGES + 1):
+    page = 0
+    while True:
+        page += 1
         params = [
             ("minRemainingTermInDays", str(INVEST_MIN_REMAINING_TERM_IN_DAYS)),
             ("maxRemainingTermInDays", str(INVEST_MAX_REMAINING_TERM_IN_DAYS)),
@@ -185,8 +191,6 @@ def fetch_marketplace_loans(
                 loans.append(loan)
         if page >= int((payload.get("meta") or {}).get("last_page") or 1):
             return loans
-    log.warning("Hit MAX_LOANS_PAGES (%d) listing %s loans - listing truncated.", MAX_LOANS_PAGES, regulation_status)
-    return loans
 
 
 def _sheet_name_for_lender(lender: dict, sheet_names: list) -> str | None:
@@ -330,17 +334,39 @@ def login(session: requests.Session) -> str:
     if not LENDERMARKET_EMAIL or not LENDERMARKET_PASSWORD:
         raise RuntimeError("LENDERMARKET_EMAIL/LENDERMARKET_PASSWORD environment variables are required.")
 
-    r = session.get(CSRF_URL, headers=_HEADERS, timeout=20)
-    r.raise_for_status()
+    # Lendermarket intermittently answers the login POST with a 2xx and a
+    # non-JSON (empty/HTML) body, seen on GitHub Actions - retry with a fresh
+    # CSRF token and log what came back instead of crashing on r.json().
+    payload = None
+    for attempt in range(1, _LOGIN_MAX_ATTEMPTS + 1):
+        r = session.get(CSRF_URL, headers=_HEADERS, timeout=20)
+        r.raise_for_status()
 
-    r = session.post(
-        LOGIN_URL,
-        json={"email": LENDERMARKET_EMAIL, "password": LENDERMARKET_PASSWORD},
-        headers=_xsrf_headers(session),
-        timeout=20,
-    )
-    r.raise_for_status()
-    data = r.json().get("data") or {}
+        r = session.post(
+            LOGIN_URL,
+            json={"email": LENDERMARKET_EMAIL, "password": LENDERMARKET_PASSWORD},
+            headers=_xsrf_headers(session),
+            timeout=20,
+        )
+        r.raise_for_status()
+        try:
+            payload = r.json()
+            break
+        except ValueError:
+            log.warning(
+                "Lendermarket login returned a non-JSON body (attempt %d/%d, status=%s, content-type=%s, "
+                "length=%d): %r",
+                attempt, _LOGIN_MAX_ATTEMPTS, r.status_code, r.headers.get("Content-Type"),
+                len(r.content), r.text[:200],
+            )
+            if attempt < _LOGIN_MAX_ATTEMPTS:
+                time.sleep(2 * attempt)
+    if payload is None:
+        raise RuntimeError(
+            f"Lendermarket login returned a non-JSON response {_LOGIN_MAX_ATTEMPTS} times in a row "
+            f"(last status={r.status_code})."
+        )
+    data = payload.get("data") or {}
     mandatory_steps = (data.get("person") or {}).get("mandatorySteps") or []
     needs_totp = any(step.get("stepName") == "TOTP_CHALLENGE" for step in mandatory_steps)
 
@@ -634,7 +660,8 @@ def invest_selected_lenders(
     on the marketplace is reported by mail (once, see shared/missing_loans.py).
     `search_state` is a dict persisted between runs (known lenders, last scan,
     mail gates). Each loan is then checked against its lender's
-    min/max rate, and the whole `balance` is allocated across all the
+    min/max rate, and the whole investable balance (`balance` minus the
+    "Garder non investi" amount) is allocated across all the
     candidate loans by `plan_allocations()`: per-lender min/max amount per
     investment, "Pourcentage max du solde par loan" and "Pourcentage max du
     solde par pays" caps (both relative to balance + everything already
@@ -703,6 +730,7 @@ def invest_selected_lenders(
 
     candidates = []
     loan_lookup = {}
+    loan_raw = {}
     for sheet_name, country in matched:
         loans = loans_by_name[sheet_name]
         stats["lender_stats"][sheet_name] = {
@@ -729,14 +757,16 @@ def invest_selected_lenders(
                 rate = None
             candidates.append(Candidate(loan_uuid, sheet_name, available, rate))
             loan_lookup[loan_uuid] = (sheet_name, rate)
+            loan_raw[loan_uuid] = loan
 
     if not candidates:
         log.info("No available loan for the active Lendermarket lenders %s - nothing to invest this run.", [m[0] for m in matched])
         return stats
 
-    plan = plan_allocations(candidates, tracker, balance, MIN_INVESTMENT_AMOUNT)
+    budget = config.investable_balance(balance)
+    plan = plan_allocations(candidates, tracker, budget, MIN_INVESTMENT_AMOUNT)
     if not plan:
-        log.info("%d candidate loan(s), nothing fundable under the configured limits (balance=%.2f EUR).", len(candidates), balance)
+        log.info("%d candidate loan(s), nothing fundable under the configured limits (balance=%.2f EUR, investable=%.2f EUR).", len(candidates), balance, budget)
         return stats
 
     for loan_uuid, amount in plan.items():
@@ -744,6 +774,9 @@ def invest_selected_lenders(
         stats["lender_budgets"][sheet_name] = stats["lender_budgets"].get(sheet_name, 0.0) + amount
         stats["lender_stats"][sheet_name]["budget"] += amount
     log.info("Investment plan (loan uuid -> EUR): %s", plan)
+    if DRY_RUN:
+        log.info("Dry run - nothing bought.")
+        return stats
 
     for loan_uuid, amount in plan.items():
         sheet_name, rate = loan_lookup[loan_uuid]
@@ -762,7 +795,12 @@ def invest_selected_lenders(
         else:
             stats["invest_failures"] += 1
             lender_stat["failures"] += 1
-            stats["failed_attempts"].append({"label": sheet_name, "amount": amount, "reason": failure_reason})
+            stats["failed_attempts"].append({
+                "label": sheet_name, "amount": amount, "reason": failure_reason,
+                # Marketplace data of the loan + plan, attached to the email to diagnose a rejection.
+                "loan_uuid": loan_uuid, "loan": loan_raw.get(loan_uuid),
+                "context": {"balance_before": balance, "balance_now": stats["balance_after"], "plan": plan},
+            })
 
     stats["country_status"] = tracker.country_status(relevant_countries)
     stats["originator_cap_status"] = tracker.loan_cap_status()
@@ -771,7 +809,7 @@ def invest_selected_lenders(
 
 def run() -> None:
     # Before the startup wait: schedule check against the sheet + stop if no market is active.
-    disabled, wait_range = begin_run("Lendermarket", LENDERMARKET_CRON_JOB_ID, CRON_SCHEDULE_STATE_FILE, 2, 30)
+    disabled, wait_range = begin_run("Lendermarket", LENDERMARKET_CRON_JOB_ID, CRON_SCHEDULE_STATE_FILE)
     if disabled:
         return
 
@@ -829,6 +867,11 @@ def run() -> None:
             pass
         elif not config.active_names():
             log.info("Skipping auto-invest: no Lendermarket lender is active (ACTIF = x) in the 'config robots' sheet.")
+        elif config.investable_balance(balance) < MIN_INVESTMENT_AMOUNT:
+            log.info(
+                "Auto-invest bot stopping: balance (%.2f EUR) minus the amount kept uninvested (%.2f EUR) is below the minimum investment amount (%.2f EUR).",
+                balance, config.keep_uninvested, MIN_INVESTMENT_AMOUNT,
+            )
         else:
             geo_snapshot = None
             try:
@@ -882,15 +925,18 @@ def run() -> None:
     # Same cron-job.org speed-up/slow-down as Swaper (see cron_schedule.py):
     # poll faster while there's money to invest. The two intervals come from
     # the "Temps planification solde (in)suffisant" columns of the Lendermarket
-    # row in "config robots" (defaults 30 min / 2 min). Skipped when the
+    # row in "config robots" (both required). Skipped when the
     # balance couldn't be determined, rather than guessing and possibly
     # slowing down polling incorrectly.
     if balance is not None:
-        sufficient = balance >= 10
-        ensure_schedule_interval(
-            resolve_schedule_minutes("Lendermarket", sufficient, 2 if sufficient else 30, config),
-            cron_job_id=LENDERMARKET_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE, sufficient=sufficient,
-        )
+        investable = config.investable_balance(balance) if config else balance
+        sufficient = investable >= 10
+        minutes = resolve_schedule_minutes("Lendermarket", sufficient, config)
+        if minutes is not None:
+            ensure_schedule_interval(
+                minutes,
+                cron_job_id=LENDERMARKET_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE, sufficient=sufficient,
+            )
 
     save_state(STATE_FILE, state)
 

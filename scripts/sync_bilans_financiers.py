@@ -9,8 +9,11 @@ Pour chaque plateforme listée dans l'onglet (sections "Crowdlending", ...) :
   prêts" sans plateforme) ;
 - sous chaque société (et sous la plateforme elle-même pour ses propres bilans),
   une ligne par bilan est (ré)écrite avec tous les détails, y compris le détail
-  de la note par critère.
+  de la note par critère ;
+- le pays du siège de chaque société de prêts (colonne "Pays du siège", écrite sur
+  la ligne de la société, en français) est lu dans les données de la page.
 
+Les pondérations de la note sont lues dans la page du site (valeurs de secours sinon).
 Données : API publique /api/public/bilans-financiers + liens plateforme/société
 embarqués dans la page (payload Next.js). Aucun login, pas de navigateur.
 
@@ -28,6 +31,7 @@ from datetime import datetime
 import requests
 from gspread.utils import rowcol_to_a1
 
+from scripts.bilans_methodo import parse_methodo
 from shared.google_sheet import _call_with_retry, get_worksheet_by_name
 from shared.notifier import send_bilans_sync_issues_email, send_new_bilans_email
 
@@ -44,19 +48,57 @@ DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() in ("1", "true", "yes")
 EXTRA_PLATFORMS = {"bondora"}
 
 COLUMNS = [
-    "Exercice", "Audit", "Auditeur", "Devise", "Taux (1 € =)",
+    "Exercice", "Type de compte", "Pays du siège", "Audit", "Auditeur", "Opinion d'audit", "Normes comptables",
+    "Devise", "Taux (1 € =)",
     "CA brut (devise)", "CA brut (€)", "Résultat net (devise)",
     "Total actif (devise)", "Trésorerie (devise)", "Total dettes (devise)",
-    "Capitaux propres (devise)",
-    "Marge (%)", "ROA (%)", "ROE (%)", "Dettes/CP", "Cash/Dette (%)",
-    "Score marge", "Score ROA", "Score ROE", "Score Dettes/CP", "Score Cash/Dette",
-    "Note /5", "PDF 1", "PDF 2", "PDF 3", "Analyse IA", "Mis à jour le",
+    "Capitaux propres (devise)", "Dépréciations (devise)", "Charges d'exploitation (devise)",
+    "Marge (%)", "ROE (%)", "Dettes/CP",
+    "Rentabilité (%)", "Fonds propres (%)", "Impayés (%)", "Trésorerie (%)", "Trésorerie (mois)",
+    "Score rentabilité", "Score fonds propres", "Score impayés", "Score trésorerie", "Score fiabilité",
+    "Détail de la note", "Note /5", "Alertes", "PDF 1", "PDF 2", "PDF 3", "Analyse IA", "Mis à jour le",
     "Commentaire plateforme / société",
 ]
 FIRST_DATA_COL = 2  # colonne B (la colonne A contient les noms)
 INTEGER_COLUMNS = {"CA brut (devise)", "CA brut (€)", "Résultat net (devise)",
                    "Total actif (devise)", "Trésorerie (devise)",
-                   "Total dettes (devise)", "Capitaux propres (devise)"}
+                   "Total dettes (devise)", "Capitaux propres (devise)",
+                   "Dépréciations (devise)", "Charges d'exploitation (devise)"}
+TEXT_COLUMNS = {"PDF 1", "PDF 2", "PDF 3", "Exercice", "Type de compte", "Pays du siège", "Audit", "Auditeur",
+                "Opinion d'audit", "Normes comptables", "Devise", "Détail de la note", "Alertes",
+                "Analyse IA", "Mis à jour le", "Commentaire plateforme / société"}
+
+# Pondérations de secours de la note /5 (V2), utilisées seulement si la page du site ne peut
+# pas être lue. Un critère sans objet (score absent) est retiré et la note est ramenée
+# sur 5 avec les poids restants.
+WEIGHTS = {
+    "preteur": {"rentabilite": .20, "fonds_propres": .25, "impayes": .25, "tresorerie": .10, "fiabilite": .20},
+    "plateforme": {"rentabilite": .25, "fonds_propres": .30, "tresorerie": .25, "fiabilite": .20},
+}
+CRITERIA_LABELS = {"rentabilite": "Rentabilité", "fonds_propres": "Fonds propres", "impayes": "Impayés",
+                   "tresorerie": "Trésorerie", "fiabilite": "Fiabilité"}
+ACCOUNT_TYPES = {"preteur": "Prêteur", "vehicule": "Véhicule de financement", "holding": "Holding",
+                 "emprunteur": "Emprunteur", "plateforme_intermediaire": "Plateforme (intermédiaire)",
+                 "plateforme_risque": "Plateforme (avec actif au bilan)"}
+AUDIT_OPINIONS = {"sans_reserve": "Sans réserve", "avec_reserve": "Avec réserve",
+                  "examen_limite": "Examen limité", "non_audite": "Non audité", "extrait": "Extrait des comptes",
+                  "non_disponible": "Non disponible"}
+ACCOUNTING_STANDARDS = {"ifrs": "IFRS", "local": "Normes locales"}
+
+# Code ISO du site (pays_siege) -> nom français, tel qu'utilisé dans les autres onglets du Sheet
+# (la web app en déduit le drapeau). Un code absent est écrit tel quel.
+COUNTRY_NAMES_FR = {
+    "AE": "Émirats arabes unis", "AL": "Albanie", "AM": "Arménie", "AR": "Argentine", "AT": "Autriche",
+    "AU": "Australie", "BG": "Bulgarie", "BW": "Botswana", "CA": "Canada", "CH": "Suisse",
+    "CO": "Colombie", "CY": "Chypre", "CZ": "République tchèque", "EE": "Estonie", "ES": "Espagne",
+    "FI": "Finlande", "FR": "France", "GB": "Royaume-Uni", "GE": "Géorgie", "HR": "Croatie",
+    "ID": "Indonésie", "IE": "Irlande", "IS": "Islande", "IT": "Italie", "KE": "Kenya",
+    "KZ": "Kazakhstan", "LT": "Lituanie", "LU": "Luxembourg", "LV": "Lettonie", "MD": "Moldavie",
+    "MK": "Macédoine du Nord", "MT": "Malte", "MX": "Mexique", "MY": "Malaisie", "NA": "Namibie",
+    "NG": "Nigeria", "PE": "Pérou", "PH": "Philippines", "PL": "Pologne", "PT": "Portugal",
+    "RO": "Roumanie", "SE": "Suède", "SG": "Singapour", "SK": "Slovaquie", "UG": "Ouganda",
+    "US": "États-Unis", "UZ": "Ouzbékistan", "VN": "Vietnam", "XK": "Kosovo", "ZA": "Afrique du Sud",
+}
 
 
 def norm(text: str) -> str:
@@ -81,19 +123,39 @@ def fetch_rows() -> list[dict]:
     return rows
 
 
-def fetch_reference_data() -> tuple[list[dict], list[dict], list[dict]]:
-    """Plateformes, sociétés de prêts et liens plateforme/société (payload RSC)."""
+def fetch_page() -> str:
     r = requests.get(PAGE_URL, headers=HEADERS_HTTP, timeout=30)
     r.raise_for_status()
-    chunks = re.findall(r'self\.__next_f\.push\(\[1,"(.*?)"\]\)</script>', r.text, flags=re.S)
+    return r.text
+
+
+def fetch_reference_data(page: str) -> tuple[list[dict], list[dict], list[dict]]:
+    """Plateformes, sociétés de prêts et liens plateforme/société (payload RSC)."""
+    chunks = re.findall(r'self\.__next_f\.push\(\[1,"(.*?)"\]\)</script>', page, flags=re.S)
     payload = "".join(json.loads('"' + c + '"') for c in chunks)
+    payload_bytes = payload.encode("utf-8")
     decoder = json.JSONDecoder()
+
+    def resolve_text(value):
+        """Les textes longs sont des références "$<id>" vers un chunk "<id>:T<longueur hex>,<texte>"
+        (longueur en octets UTF-8, chunks parfois collés sans saut de ligne)."""
+        if not isinstance(value, str) or not re.fullmatch(r"\$[0-9a-f]+", value):
+            return value
+        m = re.search(rb"(?<![0-9A-Za-z])" + re.escape(value[1:].encode()) + rb":T([0-9a-f]+),", payload_bytes)
+        if not m:
+            log.warning("Référence de texte %s introuvable dans la page des bilans.", value)
+            return ""
+        start = m.end()
+        return payload_bytes[start:start + int(m.group(1), 16)].decode("utf-8")
 
     def extract(key: str) -> list[dict]:
         idx = payload.find(f'"{key}":[')
         if idx < 0:
             raise RuntimeError(f"Clé '{key}' introuvable dans la page des bilans.")
         value, _ = decoder.raw_decode(payload[idx + len(key) + 3:])
+        for item in value:
+            if "note_externe" in item:
+                item["note_externe"] = resolve_text(item["note_externe"])
         return value
 
     return extract("plateformes"), extract("societesPrets"), extract("associationLinks")
@@ -114,6 +176,11 @@ def find_societe(name: str, societes: list[dict]) -> dict | None:
     return None
 
 
+def country_label(societe: dict | None) -> str:
+    code = ((societe or {}).get("pays_siege") or "").strip().upper()
+    return COUNTRY_NAMES_FR.get(code, code)
+
+
 def audit_label(row: dict) -> str:
     if not row.get("audite"):
         return "Non audité"
@@ -128,15 +195,43 @@ def num(value, digits=2):
     return "" if value is None else round(value, digits)
 
 
-def bilan_line(row: dict) -> list:
+def fr(value) -> str:
+    return f"{value:g}".replace(".", ",")
+
+
+def note_detail(computed: dict, all_weights: dict) -> str:
+    """Décompose la note : score × poids de chaque critère (critères sans objet retirés)."""
+    weights = all_weights.get(computed.get("grille"))
+    scores = computed.get("scores") or {}
+    if not weights or computed.get("note_sur_5") is None:
+        return ""
+    used = {k: w for k, w in weights.items() if scores.get(k) is not None}
+    parts = [f"{CRITERIA_LABELS[k]} {fr(scores[k])}/5 × {round(w * 100):g} %" for k, w in used.items()]
+    skipped = [CRITERIA_LABELS[k] for k in weights if k not in used]
+    text = " + ".join(parts)
+    if skipped:
+        text += f" (sans objet : {', '.join(skipped)} ; ramené sur 5)"
+    return f"{text} = {fr(round(computed['note_sur_5'], 2))}/5"
+
+
+def money(value):
+    return "" if value is None else value
+
+
+def bilan_line(row: dict, weights: dict = WEIGHTS) -> list:
     computed = row.get("computed") or {}
     ratios, scores = computed.get("ratios") or {}, computed.get("scores") or {}
     rate = row.get("taux_vers_eur") or 1
     ca = row.get("ca_brut")
     values = {
         "Exercice": row.get("exercice_label") or "",
+        "Type de compte": ACCOUNT_TYPES.get(row.get("type_compte"), row.get("type_compte") or ""),
+        "Pays du siège": "",
         "Audit": audit_label(row),
         "Auditeur": row.get("auditeur_nom") or "",
+        "Opinion d'audit": AUDIT_OPINIONS.get(row.get("opinion_audit"), row.get("opinion_audit") or ""),
+        "Normes comptables": ACCOUNTING_STANDARDS.get(row.get("normes_comptables"),
+                                                       row.get("normes_comptables") or ""),
         "Devise": row.get("devise") or "",
         "Taux (1 € =)": row.get("taux_vers_eur") if row.get("taux_vers_eur") is not None else "",
         "CA brut (devise)": "" if ca is None else ca,
@@ -146,17 +241,25 @@ def bilan_line(row: dict) -> list:
         "Trésorerie (devise)": "" if row.get("tresorerie") is None else row["tresorerie"],
         "Total dettes (devise)": "" if row.get("total_dettes") is None else row["total_dettes"],
         "Capitaux propres (devise)": "" if row.get("total_capitaux_propres") is None else row["total_capitaux_propres"],
+        "Dépréciations (devise)": money(row.get("depreciations")),
+        "Charges d'exploitation (devise)": money(row.get("charges_exploitation")),
         "Marge (%)": pct(ratios.get("marge")),
-        "ROA (%)": pct(ratios.get("roa")),
         "ROE (%)": pct(ratios.get("roe")),
         "Dettes/CP": num(ratios.get("dettes_sur_cp")),
-        "Cash/Dette (%)": pct(ratios.get("cash_sur_dette")),
-        "Score marge": num(scores.get("marge")),
-        "Score ROA": num(scores.get("roa")),
-        "Score ROE": num(scores.get("roe")),
-        "Score Dettes/CP": num(scores.get("dettes_sur_cp")),
-        "Score Cash/Dette": num(scores.get("cash_sur_dette")),
+        "Rentabilité (%)": pct(ratios.get("rentabilite")),
+        "Fonds propres (%)": pct(ratios.get("fonds_propres")),
+        "Impayés (%)": pct(ratios.get("impayes")),
+        "Trésorerie (%)": pct(ratios.get("tresorerie")),
+        "Trésorerie (mois)": num(ratios.get("tresorerie_mois")),
+        "Score rentabilité": num(scores.get("rentabilite")),
+        "Score fonds propres": num(scores.get("fonds_propres")),
+        "Score impayés": num(scores.get("impayes")),
+        "Score trésorerie": num(scores.get("tresorerie")),
+        "Score fiabilité": num(scores.get("fiabilite")),
+        "Détail de la note": note_detail(computed, weights),
         "Note /5": num(computed.get("note_sur_5")),
+        "Alertes": " ; ".join(a if isinstance(a, str) else json.dumps(a, ensure_ascii=False)
+                              for a in computed.get("alertes") or []),
         "PDF 1": row.get("pdf_fichier_1") or "",
         "PDF 2": row.get("pdf_fichier_2") or "",
         "PDF 3": row.get("pdf_fichier_3") or "",
@@ -196,7 +299,8 @@ def parse_sheet(grid: list[list[str]], platform_names: set[str]) -> list[dict]:
 
 
 def build_grid(header: list[str], items: list[dict], rows: list[dict],
-               plateformes: list[dict], societes: list[dict], links: list[dict]):
+               plateformes: list[dict], societes: list[dict], links: list[dict],
+               weights: dict = WEIGHTS):
     by_platform_id = {}
     by_societe_id = {}
     for r in rows:
@@ -210,16 +314,20 @@ def build_grid(header: list[str], items: list[dict], rows: list[dict],
     width = 1 + len(COLUMNS)
     comment_idx = width - 1
 
-    def line(name="", data=None, comment=""):
+    country_idx = 1 + COLUMNS.index("Pays du siège")
+
+    def line(name="", data=None, comment="", country=""):
         out = [name] + (data if data is not None else [""] * len(COLUMNS))
         out[comment_idx] = comment
+        if country:
+            out[country_idx] = country
         return out
 
     grid, kinds, issues = [header], ["header"], []
 
     def add_bilans(entity_rows):
         for r in sorted_bilans(entity_rows):
-            grid.append(line(data=bilan_line(r)))
+            grid.append(line(data=bilan_line(r, weights)))
             kinds.append("bilan")
 
     for item in items:
@@ -239,7 +347,8 @@ def build_grid(header: list[str], items: list[dict], rows: list[dict],
             log.warning("Plateforme '%s' introuvable sur le site.", item["b"])
             issues.append(f"Plateforme '{item['b']}' introuvable sur le site")
         grid.append(line(item["b"],
-                         comment=(platform or {}).get("note_externe") or (same_name or {}).get("note_externe") or ""))
+                         comment=(platform or {}).get("note_externe") or (same_name or {}).get("note_externe") or "",
+                         country=country_label(same_name)))
         kinds.append("platform")
         add_bilans(own_rows)
 
@@ -260,7 +369,8 @@ def build_grid(header: list[str], items: list[dict], rows: list[dict],
             if s is None:
                 log.warning("Société '%s' (sous %s) introuvable sur le site.", entry["label"], item["b"])
                 issues.append(f"Société '{entry['label']}' (sous {item['b']}) introuvable sur le site")
-            grid.append(line(entry["label"], comment=(s or {}).get("note_externe") or ""))
+            grid.append(line(entry["label"], comment=(s or {}).get("note_externe") or "",
+                             country=country_label(s)))
             kinds.append("company")
             if s:
                 add_bilans(by_societe_id.get(s["id"], []))
@@ -323,8 +433,7 @@ def apply_format(ws, kinds: list[str], total_rows: int) -> None:
         letter = rowcol_to_a1(1, col)[:-1]
         if name in INTEGER_COLUMNS:
             fmt = {"type": "NUMBER", "pattern": "#,##0"}
-        elif name in ("PDF 1", "PDF 2", "PDF 3", "Exercice", "Audit", "Auditeur", "Devise",
-                      "Analyse IA", "Mis à jour le", "Commentaire plateforme / société"):
+        elif name in TEXT_COLUMNS:
             continue
         else:
             fmt = {"type": "NUMBER", "pattern": "0.0#"}
@@ -353,15 +462,26 @@ def run() -> None:
 
 def _run() -> None:
     rows = fetch_rows()
-    plateformes, societes, links = fetch_reference_data()
+    page = fetch_page()
+    plateformes, societes, links = fetch_reference_data(page)
     log.info("Site : %d plateformes, %d sociétés, %d liens.", len(plateformes), len(societes), len(links))
+
+    methodo = None
+    try:
+        methodo = parse_methodo(page)
+        if len(methodo["weights"]) != 2 or not all(c["scale"] for c in methodo["criteria"]):
+            raise ValueError("méthode de notation incomplète dans la page")
+    except Exception:
+        log.exception("Méthode de notation illisible : pondérations de secours utilisées.")
+        methodo = None
+    weights = methodo["weights"] if methodo else WEIGHTS
 
     ws = get_worksheet_by_name(SHEET_NAME)
     existing = _call_with_retry(ws.get_all_values)
     platform_names = {norm(p["nom"]) for p in plateformes}
     items = parse_sheet(existing, platform_names)
     header_name = (existing[0][0] if existing and existing[0] else "") or "Nom"
-    grid, kinds, issues = build_grid([header_name] + COLUMNS, items, rows, plateformes, societes, links)
+    grid, kinds, issues = build_grid([header_name] + COLUMNS, items, rows, plateformes, societes, links, weights)
     if issues and not DRY_RUN:
         send_bilans_sync_issues_email(issues)
 

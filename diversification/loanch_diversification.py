@@ -221,10 +221,10 @@ from shared.google_sheet import (
     fill_geographic_repartition_amounts,
     fill_geographic_repartition_uninvested_amount,
     fill_remaining_duration_amounts,
+    default_after_late_days,
 )
 from shared.rate_sheet import fill_rate_amounts
 from shared.remaining_duration import (
-    DEFAULT_AFTER_LATE_DAYS,
     RateWeights,
     base_term_between,
     base_term_from_days,
@@ -233,6 +233,7 @@ from shared.remaining_duration import (
 )
 from shared.loan_durations import durations_from_json_items, parse_amount, record_platform_loan_durations
 from shared.report_date import get_report_now, is_current_month
+from shared.retry import retry_call
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
@@ -267,7 +268,6 @@ BONUS_TYPE = 10
 # Server caps page_size at 200 regardless of the value requested (verified
 # live 2026-08-14: page_size=500 still returned only 200 rows/page).
 TRANSACTIONS_PAGE_SIZE = 200
-MAX_TRANSACTIONS_PAGES = 100
 # Cache of every transaction row ever fetched (see get_cached_transactions()
 # below) - avoids re-fetching the account's entire history every run, same
 # idea as peerberry_diversification.XIRR_CASHFLOWS_STATE_FILE.
@@ -505,7 +505,7 @@ def aggregate_remaining_durations(investments: list, today: date, rates=None) ->
                 due = today - timedelta(days=delayed_days)
             if due >= today:
                 due = today - timedelta(days=delayed_days)
-            term = overdue_months_and_days(today, due, default=delayed_days > DEFAULT_AFTER_LATE_DAYS)
+            term = overdue_months_and_days(today, due, default=delayed_days > default_after_late_days("Loanch", originator))
         if term is None:
             try:
                 maturity = date.fromisoformat(inv["maturity_date"][:10])
@@ -654,7 +654,7 @@ def get_cached_transactions(session: requests.Session) -> list:
     new_entries = []
     page_number = 1
     reached_cached_entry = False
-    while page_number <= MAX_TRANSACTIONS_PAGES:
+    while True:
         body = fetch_transactions_page(session, page_number)
         page_entries = body.get("results") or []
         log.info("Page %d: %d entrie(s) found.", page_number, len(page_entries))
@@ -666,8 +666,6 @@ def get_cached_transactions(session: requests.Session) -> list:
         if reached_cached_entry or not body.get("next"):
             break
         page_number += 1
-    else:
-        log.warning("Hit MAX_TRANSACTIONS_PAGES (%d) without reaching a cached entry or the end of the ledger - it may be incomplete.", MAX_TRANSACTIONS_PAGES)
 
     seen = set()
     merged = []
@@ -1095,10 +1093,10 @@ def run() -> None:
 
     try:
         log.info("Fetching this month's statement totals...")
-        statement_totals = fetch_current_month_statement_totals(session)
+        statement_totals = retry_call(lambda: fetch_current_month_statement_totals(session), "this month's statement totals")
     except Exception:
-        log.exception("Failed to fetch this month's interest paid/rewards - defaulting both to 0.0.")
-        statement_totals = {"interest_paid": 0.0, "rewards": 0.0}
+        log.exception("Failed to fetch this month's interest paid/rewards - aborting rather than writing 0 to the Sheet.")
+        sys.exit(1)
 
     originators = aggregate_by_originator(investments)
     log.info("Fetched %d active investment(s) across %d loan originator(s).", len(investments), len(originators))
@@ -1452,11 +1450,12 @@ def run() -> None:
             )
         except Exception:
             log.exception("Failed to update the 'durée' sheet for Loanch.")
-
-        try:
-            fill_rate_amounts("Loanch", rates)
-        except Exception:
-            log.exception("Failed to update the 'taux' sheet for Loanch.")
+        else:
+            # Only when the durations were fetched: an empty `rates` would wipe the base-term rows of "taux".
+            try:
+                fill_rate_amounts("Loanch", rates)
+            except Exception:
+                log.exception("Failed to update the 'taux' sheet for Loanch.")
 
 
 if __name__ == "__main__":

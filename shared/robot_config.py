@@ -22,21 +22,32 @@ suivante) :
   secondaire (colonnes optionnelles ci-dessous, ignorées sur le marché primaire).
   Si aucun loan de la plateforme n'est actif (primaire ou secondaire), le
   robot s'arrête dès le début du run, avant le jitter.
-- Durée restante min / max : durée restante du prêt, en mois.
+- Durée restante min / max : durée restante du prêt, en mois (Income Marketplace :
+  mois avant la date de rachat, comme le filtre "Remaining Term" du site).
 - décote / prime min / max : en % du principal, négatif = décote, positif = prime.
 - Temps planification solde insuffisant / suffisant (colonnes facultatives,
   lues sur la LIGNE DE LA PLATEFORME uniquement) : intervalle entre deux
   exécutions du robot (cron-job.org) quand le solde est sous / au-dessus du
   minimum d'investissement. Format : un ou plusieurs "<nombre><unité>" avec
   unité min / h / j, ex. "5min", "1h", "1h 5min", "2j", "1j 12h", "1h30"
-  (nombre seul = minutes). Vide ou invalide = valeur par défaut du robot.
+  (nombre seul = minutes). Obligatoire : vide ou invalide = le robot s'arrête
+  avec une erreur.
   cron-job.org ne sait exprimer exactement que : diviseurs de 60 min, heures
   entières divisant 24, jours entiers ; le reste est arrondi au plus proche.
 - Temps attente avant démarrage borne inférieure / supérieure (colonnes
   facultatives, ligne de la PLATEFORME, même format) : le robot attend une
-  durée aléatoire (jitter) entre ces deux bornes avant de démarrer. Borne
-  inférieure vide = 0 ; borne supérieure vide = égale à la borne inférieure
-  (attente fixe) ; les deux vides ou invalides = jitter par défaut du robot.
+  durée aléatoire (jitter) entre ces deux bornes avant de démarrer (0min =
+  pas d'attente). Les deux bornes sont obligatoires : vide ou invalide = le
+  robot s'arrête avec une erreur.
+- Garder non investi (colonne facultative, ligne de la PLATEFORME, en €) :
+  somme que le robot laisse non investie. Il n'investit que le solde
+  disponible au-delà de cette somme (et seulement si l'excédent atteint le
+  montant minimum d'investissement). Vide ou invalide = tout le solde est
+  investissable.
+- Inclure prêts extensibles (colonne facultative, propre à Income Marketplace,
+  lue sur la ligne de chaque loan) : "x" = le robot accepte les prêts dont
+  l'échéancier est prolongeable ; vide = il les ignore (option "Exclude
+  extendable loans" du site). Colonne absente = ces prêts sont acceptés.
 """
 
 import logging
@@ -84,6 +95,8 @@ _OPTIONAL_COLUMN_PREFIXES = {
     "max_months": "duree restante max",
     "min_premium": "decote / prime min",
     "max_premium": "decote / prime max",
+    "keep_uninvested": "garder non investi",
+    "include_extendable": "inclure prets extensibles",
 }
 
 
@@ -158,6 +171,7 @@ class LoanConfig:
     max_months: float | None = None
     min_premium: float | None = None
     max_premium: float | None = None
+    include_extendable: bool = True
 
     def secondary_rejection_reason(self, rate, premium, months) -> str | None:
         """None si un prêt du marché secondaire (taux, prime en % -
@@ -202,6 +216,12 @@ class PlatformConfig:
     schedule_sufficient_minutes: int | None = None
     startup_wait_min_minutes: int | None = None
     startup_wait_max_minutes: int | None = None
+    keep_uninvested: float = 0.0
+
+    def investable_balance(self, balance: float) -> float:
+        """Part du solde disponible que le robot peut investir : le solde moins
+        la somme à garder non investie (jamais négatif)."""
+        return max(0.0, round(balance - self.keep_uninvested, 2))
 
     @property
     def disabled(self) -> bool:
@@ -209,24 +229,31 @@ class PlatformConfig:
         le marché primaire ni sur le secondaire) : le robot ne doit rien faire."""
         return not (self.active_names() or self.secondary_names())
 
-    def startup_wait_range(self) -> tuple | None:
-        """(borne basse, borne haute) en minutes du jitter de démarrage ; None
-        si les deux colonnes sont vides/invalides."""
+    def startup_wait_range(self) -> tuple:
+        """(borne basse, borne haute) en minutes du jitter de démarrage ; les
+        deux colonnes doivent être renseignées (RuntimeError sinon)."""
         low, high = self.startup_wait_min_minutes, self.startup_wait_max_minutes
-        if low is None and high is None:
-            return None
-        low = 0 if low is None else low
-        high = low if high is None else high
+        if low is None or high is None:
+            raise RuntimeError(
+                f"Config robot {self.platform} : 'Temps attente avant démarrage' borne inférieure et supérieure "
+                f"obligatoires (0min accepté). Choisis-les dans la page Configuration robots."
+            )
         return min(low, high), max(low, high)
 
     def active_names(self) -> list:
         return [name for name, loan in self.loans.items() if loan.active]
 
-    def schedule_minutes(self, sufficient: bool, default: int) -> int:
+    def schedule_minutes(self, sufficient: bool) -> int:
         """Intervalle (minutes) entre deux exécutions du robot selon que le
-        solde est suffisant ou non ; `default` si la cellule est vide/invalide."""
+        solde est suffisant ou non ; la cellule doit être renseignée
+        (RuntimeError sinon)."""
         value = self.schedule_sufficient_minutes if sufficient else self.schedule_insufficient_minutes
-        return value if value is not None else default
+        if value is None:
+            raise RuntimeError(
+                f"Config robot {self.platform} : 'Temps planification solde {'suffisant' if sufficient else 'insuffisant'}' "
+                f"obligatoire. Choisis-le dans la page Configuration robots."
+            )
+        return value
 
     def find_loan(self, raw_name) -> LoanConfig | None:
         """Retrouve le loan dont le nom correspond à `raw_name` (exact puis
@@ -309,13 +336,19 @@ def get_platform_config(platform: str) -> PlatformConfig:
         ("startup_wait_max", "startup_wait_max_minutes"),
     ):
         raw = cell(grid[platform_idx], key)
-        minutes = parse_duration_minutes(raw)
+        minutes = parse_duration_minutes(raw, allow_zero=key.startswith("startup_wait"))
         if raw and minutes is None:
             log.warning(
                 "Config robot %s : durée '%s' invalide (ex. '5min', '1h 5min', '2j'), valeur par défaut utilisée.",
                 platform, raw,
             )
         setattr(config, attr, minutes)
+
+    keep_raw = cell(grid[platform_idx], "keep_uninvested")
+    keep = _parse_number(keep_raw)
+    if keep_raw and keep is None:
+        log.warning("Config robot %s : 'Garder non investi' = '%s' invalide (ex. '200'), aucune somme gardée.", platform, keep_raw)
+    config.keep_uninvested = max(0.0, keep or 0.0)
 
     for row in grid[platform_idx + 1:]:
         name = cell(row, "name")
@@ -338,6 +371,9 @@ def get_platform_config(platform: str) -> PlatformConfig:
             max_months=_parse_number(cell(row, "max_months")),
             min_premium=_parse_number(cell(row, "min_premium")),
             max_premium=_parse_number(cell(row, "max_premium")),
+            include_extendable=(
+                "include_extendable" not in columns or cell(row, "include_extendable").lower() == "x"
+            ),
         )
 
     log.info(
@@ -347,9 +383,7 @@ def get_platform_config(platform: str) -> PlatformConfig:
     return config
 
 
-def begin_run(
-    platform: str, cron_job_id, state_file: Path, default_sufficient: int, default_insufficient: int,
-) -> tuple:
+def begin_run(platform: str, cron_job_id, state_file: Path) -> tuple:
     """À appeler tout au début du run, avant le jitter de démarrage. Lit
     "config robots" et remet le cron cron-job.org au bon intervalle si besoin :
     celui des colonnes "Temps planification solde suffisant / insuffisant"
@@ -358,17 +392,20 @@ def begin_run(
     solde est inconnu). Retourne (arrêter, plage du jitter) : `arrêter` est
     True si aucune société de prêt de la plateforme n'est active (marché
     primaire ou secondaire) ;
-    une config illisible ne bloque pas le run (False, None)."""
+    une config illisible ne bloque pas le run (False, (0, 0) : pas d'attente, cron
+    inchangé), mais des temps de planification / d'attente non renseignés
+    l'arrêtent (RuntimeError)."""
     try:
         config = get_platform_config(platform)
     except Exception:
-        log.exception("Config robot %s illisible, vérifications de début de run ignorées.", platform)
-        return False, None
+        log.exception("Config robot %s illisible, vérifications de début de run ignorées (aucune attente).", platform)
+        return False, (0, 0)
 
+    wait_range = config.startup_wait_range()
     sufficient = load_state(state_file, CRON_DEFAULT_STATE).get("cron_schedule_sufficient")
     if isinstance(sufficient, bool):
         ensure_schedule_interval(
-            config.schedule_minutes(sufficient, default_sufficient if sufficient else default_insufficient),
+            config.schedule_minutes(sufficient),
             cron_job_id=cron_job_id, state_file=state_file, sufficient=sufficient,
         )
     else:
@@ -376,7 +413,7 @@ def begin_run(
 
     if config.disabled:
         log.info("%s : aucune société de prêt active (primaire ou secondaire) dans 'config robots', run ignoré.", platform)
-    return config.disabled, config.startup_wait_range()
+    return config.disabled, wait_range
 
 
 def is_platform_disabled(platform: str) -> bool:
@@ -393,28 +430,18 @@ def is_platform_disabled(platform: str) -> bool:
     return config.disabled
 
 
-def resolve_startup_wait_range(platform: str) -> tuple | None:
-    """(borne basse, borne haute) en minutes du jitter de démarrage du robot
-    `platform`, lues dans l'onglet "config robots" ; None si les deux sont
-    vides/invalides ou si la lecture échoue."""
-    try:
-        return get_platform_config(platform).startup_wait_range()
-    except Exception:
-        log.exception("Config robot %s illisible, jitter de démarrage par défaut utilisé.", platform)
-        return None
-
-
-def resolve_schedule_minutes(platform: str, sufficient: bool, default: int, config: "PlatformConfig | None" = None) -> int:
+def resolve_schedule_minutes(platform: str, sufficient: bool, config: "PlatformConfig | None" = None) -> int | None:
     """Intervalle de planification cron-job.org du robot `platform` : lu dans
-    l'onglet "config robots" (`config` s'il a déjà été lu ce run), `default`
-    si la lecture échoue ou si la cellule est vide/invalide."""
+    l'onglet "config robots" (`config` s'il a déjà été lu ce run). None si la
+    feuille est illisible (le cron reste inchangé) ; une cellule vide lève
+    une RuntimeError."""
     if config is None:
         try:
             config = get_platform_config(platform)
         except Exception:
-            log.exception("Config robot %s illisible, temps de planification par défaut utilisé.", platform)
-            return default
-    return config.schedule_minutes(sufficient, default)
+            log.exception("Config robot %s illisible, planification inchangée.", platform)
+            return None
+    return config.schedule_minutes(sufficient)
 
 
 class CapTracker:
@@ -538,6 +565,25 @@ def _split_equally(budget: float, items: list) -> dict:
         for loan_id, _cap, _min in active:
             shares[loan_id] = _floor2(equal)
         break
+    return _distribute_leftover_cents(budget, items, shares)
+
+
+def _distribute_leftover_cents(budget: float, items: list, shares: dict) -> dict:
+    """L'arrondi au centime inférieur laisse quelques centimes sur le solde
+    (ex. 141.05 / 3 -> 3 x 47.01 = 141.03) : on les redistribue 1 ct par prêt,
+    dans l'ordre du listing, tant que le plafond du prêt le permet."""
+    caps = {item[0]: item[1] for item in items}
+    leftover = round((budget - sum(shares.values())) * 100)
+    progressed = True
+    while leftover > 0 and progressed:
+        progressed = False
+        for loan_id in shares:
+            if leftover <= 0:
+                break
+            if shares[loan_id] + 0.01 <= caps[loan_id] + 1e-9:
+                shares[loan_id] = round(shares[loan_id] + 0.01, 2)
+                leftover -= 1
+                progressed = True
     return shares
 
 

@@ -25,12 +25,13 @@ XMLHttpRequest, X-CSRF-TOKEN (token from the page's `investConfirm` config); ans
 {"status": "ok"|"redirect", "redirect": url} or {"status": "risk"} (resend with
 risk_confirmed=true). Primary: legacy `pmForm` form POST (not verified).
 
-MODE (env AFRANGA_BOT_MODE, default "probe"):
+MODE (env AFRANGA_BOT_MODE, default "live"; the workflow's manual-run "mode" input
+can select "dry" or "probe"):
+    live  - real purchases.
     dry   - plan only, no HTTP call that changes anything.
     probe - adds the first planned line of each market to the cart, captures the
             review page structure into the diagnostics (emailed), removes the
             line again. Never buys.
-    live  - real purchases.
 
 Required env vars: AFRANGA_EMAIL, AFRANGA_PASSWORD, AFRANGA_TOTP_SECRET (if 2FA),
 GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS, SMTP_* / EMAIL_TO.
@@ -57,7 +58,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from diversification.afranga_diversification import _HEADERS, fetch_uninvested_balance, login
-from shared.cron_schedule import DAY_MINUTES, apply_startup_jitter, ensure_schedule_interval
+from shared.cron_schedule import apply_startup_jitter, ensure_schedule_interval
 from shared.google_sheet import get_geo_platform_snapshot
 from shared.missing_loans import TRANSIENT_GRACE_SECONDS, report_missing_loans
 from shared.notifier import send_afranga_invest_summary_email
@@ -78,10 +79,9 @@ DIAGNOSTICS_FILE = Path(__file__).parent / "afranga_invest_diagnostics.log"
 CRON_SCHEDULE_STATE_FILE = Path(__file__).parent / "afranga_cron_schedule_state.json"
 AFRANGA_CRON_JOB_ID = os.environ.get("AFRANGA_CRON_JOB_ID")
 
-MODE = os.environ.get("AFRANGA_BOT_MODE", "probe").strip().lower()
+MODE = os.environ.get("AFRANGA_BOT_MODE", "live").strip().lower()
 MIN_INVESTMENT_AMOUNT = float(os.environ.get("AFRANGA_MIN_INVESTMENT_AMOUNT", "10"))
 PAGE_SIZE = 100
-MAX_PAGES = 10
 # Secondary: a partial purchase must be >= this and leave >= this; smaller listings are bought in full only.
 SECONDARY_MIN_LEFT = 100.0
 MAX_DIAGNOSTICS_EMAIL_CHARS = 2_000_000
@@ -173,7 +173,9 @@ def fetch_market(session: requests.Session, page_url: str, filters: dict) -> Mar
     config = _extract_market_config(r.text)
 
     rows = []
-    for page in range(1, MAX_PAGES + 1):
+    page = 0
+    while True:
+        page += 1
         params = {**filters, "limit": str(PAGE_SIZE), "page": str(page)}
         resp = session.get(config["urls"]["rows"], params=params, headers=_ajax_headers(), timeout=20)
         resp.raise_for_status()
@@ -181,8 +183,6 @@ def fetch_market(session: requests.Session, page_url: str, filters: dict) -> Mar
         rows.extend(body.get("rows") or [])
         if page >= (body.get("last_page") or 1):
             break
-    else:
-        log.warning("Hit MAX_PAGES (%d) on %s - listing truncated.", MAX_PAGES, page_url)
     return MarketRows(config, rows)
 
 
@@ -237,7 +237,8 @@ def plan_secondary(rows: list, tracker, budget: float) -> list:
             remaining / factor,
         )
         amount = _floor2(ceiling)
-        min_amount = max(min_principal, loan.min_amount or 0.0)
+        # The platform rejects any purchase below MIN_INVESTMENT_AMOUNT, even a full exit of a tiny residual.
+        min_amount = max(min_principal, loan.min_amount or 0.0, MIN_INVESTMENT_AMOUNT)
         if row.get("full_exit_only") or max_principal < SECONDARY_MIN_LEFT:
             if amount + 0.005 < max_principal:
                 continue
@@ -454,7 +455,7 @@ def execute_market(session: requests.Session, market: MarketRows, lines: list, t
 
 def run() -> None:
     # Before the startup wait: schedule check against the sheet + stop if no market is active.
-    disabled, wait_range = begin_run("Afranga", AFRANGA_CRON_JOB_ID, CRON_SCHEDULE_STATE_FILE, 2, DAY_MINUTES)
+    disabled, wait_range = begin_run("Afranga", AFRANGA_CRON_JOB_ID, CRON_SCHEDULE_STATE_FILE)
     if disabled:
         return
 
@@ -485,14 +486,18 @@ def run() -> None:
         except Exception as exc:
             config_error = exc
             log.exception("Could not read the Afranga configuration from the 'config robots' sheet.")
-        sufficient = balance >= MIN_INVESTMENT_AMOUNT
-        default_minutes = 2 if sufficient else DAY_MINUTES
-        ensure_schedule_interval(
-            config.schedule_minutes(sufficient, default_minutes) if config else default_minutes,
-            cron_job_id=AFRANGA_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE, sufficient=sufficient,
-        )
+        investable = config.investable_balance(balance) if config else balance
+        sufficient = investable >= MIN_INVESTMENT_AMOUNT
+        if config:
+            ensure_schedule_interval(
+                config.schedule_minutes(sufficient),
+                cron_job_id=AFRANGA_CRON_JOB_ID, state_file=CRON_SCHEDULE_STATE_FILE, sufficient=sufficient,
+            )
         if not sufficient:
-            log.info("Balance below the minimum investment amount - nothing to do.")
+            log.info(
+                "Investable balance %.2f EUR (balance %.2f EUR minus %.2f EUR kept uninvested) is below the minimum investment amount - nothing to do.",
+                investable, balance, config.keep_uninvested if config else 0.0,
+            )
             return
 
         if config is None:
@@ -525,7 +530,7 @@ def run() -> None:
             )
             save_state(STATE_FILE, state)
 
-        budget = balance
+        budget = investable
         if config.secondary_names():
             filters = {}
             _range_filters(filters, "interest_rate_percent", config.lowest_min_rate(secondary=True), None)
@@ -537,7 +542,7 @@ def run() -> None:
             log.info("Secondary: %d listing(s) fetched, %d planned.", len(market.rows), len(lines))
             stats["plan"] += [_line_summary(line) for line in lines]
             execute_market(session, market, lines, tracker, stats)
-            budget = stats["balance_after"] if MODE == "live" else budget - sum(line.cost for line in lines)
+            budget = config.investable_balance(stats["balance_after"]) if MODE == "live" else budget - sum(line.cost for line in lines)
 
         if config.active_names() and budget >= MIN_INVESTMENT_AMOUNT:
             filters = {}

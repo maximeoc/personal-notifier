@@ -141,10 +141,12 @@ from shared.google_sheet import (
     fill_geographic_repartition_amounts,
     fill_geographic_repartition_uninvested_amount,
     fill_remaining_duration_amounts,
+    default_after_late_days,
 )
 from shared.rate_sheet import fill_rate_amounts
-from shared.remaining_duration import DEFAULT_AFTER_LATE_DAYS, RateWeights, overdue_months_and_days, remaining_months_and_days
+from shared.remaining_duration import BUYBACK_TRIGGER_DAYS, RateWeights, overdue_months_and_days, remaining_months_and_days
 from shared.report_date import get_report_date, is_current_month
+from shared.retry import retry_call
 from shared.session_cache import get_or_refresh_session
 from shared.state import load_state, save_state
 from shared.weighted_average import INVESTED_BALANCE_LABEL, NON_INVESTED_BALANCE_LABEL, compute_time_weighted_average
@@ -183,7 +185,6 @@ _HEADERS = {
 # `direction` field (read directly, never inferred from `type`) - this
 # list is informational/for reference only, not actually branched on.
 STATEMENT_PAGE_SIZE = 500
-MAX_STATEMENT_PAGES = 50
 
 # XIRR is a since-inception money-weighted return - this start date is
 # early enough to cover any real account's full history (Nectaro itself
@@ -344,24 +345,29 @@ def fetch_late_shares(session: requests.Session, headers: dict, isin: str) -> li
     2026-10-16: DELAYED loans have dpd 4-47 and are refreshed daily; a loan
     still late after 60 days shows BUYBACK (lending company repurchase
     obligation, not a late loan anymore); SCHEDULED rows may carry a
-    leftover dpd, so dpd only counts when DELAYED. PAID OFF/BUYBACK loans
-    carry no outstanding amount, so the weights only use the other loans.
+    leftover dpd, so dpd only counts when DELAYED. PAID OFF loans carry no
+    outstanding amount, so the weights only use the other loans. BUYBACK loans
+    stay listed (live 2026-11-09: for weeks, until PAID OFF) with `updatedAt`/`dpd`
+    frozen at the day they turned BUYBACK (dpd 61-65), so updatedAt - dpd is still
+    the missed payment date; they keep their share of the note's outstanding
+    (the buyback is not paid yet), which the DELAYED/SCHEDULED loans no longer absorb.
     Returns [(share of the note's outstanding, due date of the missed
-    payment = updatedAt - dpd)] for the DELAYED underlying loans."""
+    payment = updatedAt - dpd, is_buyback)] for the DELAYED and BUYBACK underlying loans."""
     r = session.get(f"{API_BASE}/investment/show/{isin}", headers=headers, timeout=20)
     r.raise_for_status()
     live = [
         loan for loan in r.json()["data"].get("noteSetList") or []
-        if loan.get("loanStatus") not in ("PAID OFF", "BUYBACK")
+        if loan.get("loanStatus") != "PAID OFF"
     ]
     total = sum(float(loan["principal"]) for loan in live)
     shares = []
     for loan in live:
+        is_buyback = loan.get("loanStatus") == "BUYBACK"
         dpd = loan.get("dpd") or 0
-        if loan.get("loanStatus") != "DELAYED" or dpd <= 0 or total <= 0:
+        if total <= 0 or not (is_buyback or (loan.get("loanStatus") == "DELAYED" and dpd > 0)):
             continue
         updated = date.fromisoformat(loan["updatedAt"]) if loan.get("updatedAt") else date.today()
-        shares.append((float(loan["principal"]) / total, updated - timedelta(days=dpd)))
+        shares.append((float(loan["principal"]) / total, updated - timedelta(days=dpd or BUYBACK_TRIGGER_DAYS), is_buyback))
     return shares
 
 
@@ -372,10 +378,12 @@ def fetch_current_loans(session: requests.Session, headers: dict) -> list:
     nothing about repayment lateness, see fetch_late_shares(). Only SETTLED
     loans are returned (FULFILLED ones aren't in Nectaro's outstanding yet). Returns
     [{"originator", "amount", "rate" (interestRate, in percent, e.g. 12 for
-    12%), "maturity", "late": [(share, due date)]}]."""
+    12%), "maturity", "late": [(share, due date, is_buyback)]}]."""
     loans = []
     seen = 0
-    for page in range(1, MAX_STATEMENT_PAGES + 1):
+    page = 0
+    while True:
+        page += 1
         r = session.post(
             PORTFOLIO_URL,
             json={
@@ -497,8 +505,11 @@ def aggregate_remaining_durations(session: requests.Session, headers: dict, toda
     overdue_months_and_days() since the missed payment instead (negated =
     late; (months, days, "default") if still late beyond the 60-day buyback
     obligation plus the grace period (shared DEFAULT_AFTER_LATE_DAYS; such loans turn
-    BUYBACK as soon as the 60 days pass, so the default case is inferred and never observed). Totals per originator are unchanged. Verified live 2026-10-16
-    on late loans (dpd 4-47 days); the default case is untested.
+    BUYBACK as soon as the 60 days pass, so the default case is inferred and never observed).
+    BUYBACK underlying loans (status given by the API, kept in the note until the buyback is paid)
+    get (months, days, "buyback") since their missed payment, with no delay needed in the "durée" tab.
+    Totals per originator are unchanged. Verified live 2026-10-16
+    on late loans (dpd 4-47 days) and 2026-11-09 on BUYBACK loans; the default case is untested.
     `rates` (optional RateWeights) collects each loan's `interestRate` (already
     in percent), under the same originator/term/amount as the durations, plus its
     `base_term` (see fetch_outstanding_by_loan()) for the "taux" tab."""
@@ -511,9 +522,14 @@ def aggregate_remaining_durations(session: requests.Session, headers: dict, toda
             log.warning("No base term found for the %s loan maturing %s - excluded from the 'taux' sheet.", loan["originator"], loan["maturity"])
         durations = result.setdefault(loan["originator"], {})
         normal_share = 1.0
-        for share, due in loan["late"]:
-            overdue_days = (today - due).days
-            term = overdue_months_and_days(today, due, default=overdue_days > DEFAULT_AFTER_LATE_DAYS)
+        for share, due, is_buyback in loan["late"]:
+            if is_buyback:
+                # Status given by the API: no default inference, the term is (months, days, "buyback") since the missed payment.
+                term = overdue_months_and_days(today, due)
+                term = (-term[0], -term[1], "buyback") if term is not None else None
+            else:
+                overdue_days = (today - due).days
+                term = overdue_months_and_days(today, due, default=overdue_days > default_after_late_days("Nectaro", loan["originator"]))
             if term is None:
                 continue
             durations[term] = durations.get(term, 0.0) + amount * share
@@ -549,17 +565,22 @@ def _fetch_statement_page(session: requests.Session, headers: dict, start_date: 
 
 def fetch_all_statement_transactions(session: requests.Session, headers: dict, start_date: date, end_date: date) -> list:
     """Fetch every statement transaction in [start_date, end_date]
-    (inclusive), paginating until a page returns fewer than
-    STATEMENT_PAGE_SIZE rows."""
+    (inclusive), paginating until a page comes back empty (not "fewer than
+    STATEMENT_PAGE_SIZE rows", so a server-side cap on the page size can't
+    silently truncate the history)."""
     all_transactions = []
-    for page in range(1, MAX_STATEMENT_PAGES + 1):
+    previous_rows = None
+    page = 0
+    while True:
+        page += 1
         rows = _fetch_statement_page(session, headers, start_date, end_date, page)
         log.info("Statement page %d: %d row(s) fetched.", page, len(rows))
-        all_transactions.extend(rows)
-        if len(rows) < STATEMENT_PAGE_SIZE:
+        if not rows:
             break
-    else:
-        log.warning("Hit MAX_STATEMENT_PAGES (%d) without an incomplete page - history may be truncated.", MAX_STATEMENT_PAGES)
+        if rows == previous_rows:
+            raise RuntimeError(f"Statement pagination is not advancing (page {page} repeats page {page - 1}).")
+        previous_rows = rows
+        all_transactions.extend(rows)
     return all_transactions
 
 
@@ -686,7 +707,10 @@ def run() -> None:
 
     try:
         month_start_date = today_date.replace(day=1)
-        this_month_transactions = fetch_all_statement_transactions(session, headers, month_start_date, today_date)
+        this_month_transactions = retry_call(
+            lambda: fetch_all_statement_transactions(session, headers, month_start_date, today_date),
+            "this month's statement transactions",
+        )
         gross_interest = sum(t["amount"] for t in this_month_transactions if t.get("type") == "INTEREST")
         bonus_tax = sum(t["amount"] for t in this_month_transactions if t.get("type") == "REWARD_TAXATION")
         interest_tax = sum(t["amount"] for t in this_month_transactions if t.get("type") == "TAXATION")
@@ -703,7 +727,8 @@ def run() -> None:
             gross_interest, interest_tax, bonus_tax, bonus,
         )
     except Exception:
-        log.exception("Failed to fetch this month's statement totals - defaulting interest/tax/bonus to 0.0.")
+        log.exception("Failed to fetch this month's statement totals - aborting rather than writing 0 to the Sheet.")
+        sys.exit(1)
 
     # Since-inception XIRR/Cash drag block - see module docstring for the
     # full methodology (mirrors afranga_diversification.py's original,
@@ -996,17 +1021,19 @@ def run() -> None:
         # must not fail the whole run.
         try:
             rates = RateWeights()
+            company_totals = {c["name"]: c["amount"] for c in companies}
             fill_remaining_duration_amounts(
-                "Nectaro", aggregate_remaining_durations(session, headers, today_date, rates), rates=rates
+                "Nectaro", aggregate_remaining_durations(session, headers, today_date, rates), rates=rates,
+                target_totals=company_totals,
             )
         except Exception:
             log.exception("Failed to update the 'durée' sheet for Nectaro.")
-
-        # Own try/except too: the "taux" tab is independent of the "durée" one.
-        try:
-            fill_rate_amounts("Nectaro", rates)
-        except Exception:
-            log.exception("Failed to update the 'taux' sheet for Nectaro.")
+        else:
+            # Only when the durations were fetched: an empty `rates` would wipe the base-term rows of "taux".
+            try:
+                fill_rate_amounts("Nectaro", rates, target_totals=company_totals)
+            except Exception:
+                log.exception("Failed to update the 'taux' sheet for Nectaro.")
 
 
 if __name__ == "__main__":

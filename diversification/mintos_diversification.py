@@ -286,9 +286,10 @@ from shared.google_sheet import (
     fill_geographic_repartition_amounts,
     fill_geographic_repartition_uninvested_amount,
     fill_remaining_duration_amounts,
+    default_after_late_days,
 )
 from shared.rate_sheet import fill_rate_amounts
-from shared.remaining_duration import DEFAULT_AFTER_LATE_DAYS, RateWeights, base_term_between, overdue_months_and_days, remaining_months_and_days
+from shared.remaining_duration import RateWeights, base_term_between, overdue_months_and_days, remaining_months_and_days
 from shared.report_date import get_report_date, is_current_month
 from shared.loan_durations import durations_from_json_items, record_platform_loan_durations
 from shared.state import load_state, save_state
@@ -320,7 +321,6 @@ NOTE_SERIES_PAYMENT_SCHEDULE_URL = NOTE_SERIES_URL + "/payment-schedule"
 NOTE_SERIES_LOANS_URL = NOTE_SERIES_URL + "/loans"
 NOTE_SERIES_WORKERS = 6
 LOAN_INVESTMENTS_PAGE_SIZE = 300
-MAX_INVESTMENTS_PAGES = 100
 PLATFORM_LABEL = "Mintos"
 
 # Bond names include a trailing maturity month+year, e.g. "ID Finance Sep
@@ -335,7 +335,6 @@ MIN_STATEMENT_DATE = date(2025, 1, 1)
 # Server silently caps at 100 rows/page no matter what's requested
 # (verified live: 110+ silently fell back to a 20-row default, no error).
 TRANSACTIONS_PAGE_SIZE = 100
-MAX_TRANSACTIONS_PAGES = 500
 # Cache of every account-statement row ever fetched, plus the cursor to
 # resume pagination from next run (see get_cached_transactions() below).
 XIRR_CASHFLOWS_STATE_FILE = Path(__file__).parent / "mintos_xirr_cashflows_state.json"
@@ -546,7 +545,9 @@ def fetch_loan_investments(session: requests.Session) -> list:
     headers = {"Anti-Csrf-Token": get_csrf_token(session)}
     names = _loan_originator_names_by_company(session)
     investments = []
-    for page in range(1, MAX_INVESTMENTS_PAGES + 1):
+    page = 0
+    while True:
+        page += 1
         body = {
             "currency": CURRENCY_ID,
             "pagination": {"maxResults": LOAN_INVESTMENTS_PAGE_SIZE, "page": page},
@@ -571,8 +572,7 @@ def fetch_loan_investments(session: requests.Session) -> list:
                 }
             )
         if not (data.get("pagination") or {}).get("hasNextPage"):
-            break
-    return investments
+            return investments
 
 
 def fetch_bond_investments(session: requests.Session) -> list:
@@ -717,7 +717,7 @@ def aggregate_remaining_durations(
         pieces = []
         late_share = min(sum(share for _, share in late_loans), 1.0)
         for due, share in late_loans:
-            term = overdue_months_and_days(today, due, default=in_recovery or (today - due).days > DEFAULT_AFTER_LATE_DAYS)
+            term = overdue_months_and_days(today, due, default=in_recovery or (today - due).days > default_after_late_days(PLATFORM_LABEL, originator))
             if term is not None:
                 pieces.append((term, inv["amount"] * share))
         if late_share < 1.0:
@@ -913,7 +913,9 @@ def get_cached_transactions(session: requests.Session) -> list:
     log.info("Found %d cached transaction(s) - resuming pagination (cursor=%s)...", len(cached_entries), "yes" if cursor else "start of history")
     new_entries = []
     last_good_cursor = cursor
-    for page_number in range(1, MAX_TRANSACTIONS_PAGES + 1):
+    page_number = 0
+    while True:
+        page_number += 1
         body = fetch_transaction_ledger_page(session, csrf_token, cursor)
         rows = (body.get("data") or {}).get("accountStatements") or []
         next_cursor = (body.get("data") or {}).get("nextCursor")
@@ -924,13 +926,12 @@ def get_cached_transactions(session: requests.Session) -> list:
                 continue
             cached_ids.add(tid)
             new_entries.append(row)
-        if next_cursor:
-            last_good_cursor = next_cursor
-            cursor = next_cursor
-        else:
+        if not next_cursor:
             break
-    else:
-        log.warning("Hit MAX_TRANSACTIONS_PAGES (%d) without reaching the end of the ledger - it may be incomplete.", MAX_TRANSACTIONS_PAGES)
+        if next_cursor == cursor:
+            raise RuntimeError("Transaction ledger pagination is not advancing (nextCursor repeats the current cursor).")
+        last_good_cursor = next_cursor
+        cursor = next_cursor
 
     merged = cached_entries + new_entries
     save_state(XIRR_CASHFLOWS_STATE_FILE, {"all_entries": merged, "resume_cursor": last_good_cursor})
