@@ -263,6 +263,8 @@ from shared.browser_stealth import get_context_options, apply_stealth, human_pau
 
 DEFAULT_STATE = {
     "missing_loans": {},
+    # loan id -> epoch seconds of the last failed attempt (see _active_failed_loans()).
+    "failed_loans": {},
 }
 
 load_dotenv()
@@ -288,6 +290,11 @@ MIN_INVESTMENT_AMOUNT = float(os.environ.get("MIN_INVESTMENT_AMOUNT", "10"))
 # "dry" (selected through the workflow's manual-run "mode" input) plans the
 # investments but buys nothing; scheduled runs are always "live".
 DRY_RUN = os.environ.get("SWAPER_BOT_MODE", "live").strip().lower() == "dry"
+
+# A loan whose purchase failed (modal never confirmed, exception on the click...) is left alone for this
+# long. Without it, a loan Swaper refuses to confirm stays in the list and is retried - with a failure
+# email each time - on every run, i.e. every couple of minutes while the balance is sufficient.
+FAILED_LOAN_COOLDOWN_SECONDS = float(os.environ.get("SWAPER_FAILED_LOAN_COOLDOWN_MINUTES", "360")) * 60
 
 # Loans-listing page navigated to directly (fetch_loans() lets the real
 # Angular app fire the API call itself - see that function's docstring for
@@ -840,6 +847,16 @@ def _extract_balance_from_attempts(attempts: list):
     return None
 
 
+def _active_failed_loans(state: dict) -> set:
+    """Ids of the loans still in their cooldown after a failed purchase; expired entries are dropped from
+    `state["failed_loans"]` (persisted with the rest of the state at the end of the run)."""
+    failed = state.setdefault("failed_loans", {})
+    now = time.time()
+    for loan_id in [i for i, at in failed.items() if now - at >= FAILED_LOAN_COOLDOWN_SECONDS]:
+        del failed[loan_id]
+    return set(failed)
+
+
 def _invest_available_loans(page, loans: list, shares: dict, captured_api_calls: list, groups: list = None) -> list:
     """See `_invest_loans_via_ui()`. `groups` keeps the originator filter
     applied to the SPA's list refreshes that follow every buy."""
@@ -1290,6 +1307,7 @@ def run(headless: bool = True) -> None:
                             # else, or a new one can appear, within seconds).
                             candidates = []
                             loans_by_name = {}
+                            cooling_down = _active_failed_loans(state)
                             for name in _available_originators_in_order(originator_loans):
                                 try:
                                     refreshed_payload = _with_relogin_retry(
@@ -1301,6 +1319,13 @@ def run(headless: bool = True) -> None:
                                 current_loans = _filter_loans_by_min_interest_rate(
                                     extract_loans(refreshed_payload), min_interest_rate
                                 )
+                                for loan in current_loans:
+                                    if str(loan.get("id")) in cooling_down:
+                                        log.info(
+                                            "Loan %s (%r) failed on a previous run - paused for %d min, skipping it.",
+                                            loan.get("number") or loan.get("id"), name, FAILED_LOAN_COOLDOWN_SECONDS // 60,
+                                        )
+                                current_loans = [l for l in current_loans if str(l.get("id")) not in cooling_down]
                                 if not current_loans:
                                     log.info("Originator %r no longer has any loan available right before investing - skipping.", name)
                                     continue
@@ -1350,6 +1375,8 @@ def run(headless: bool = True) -> None:
                                     # in the same run see them.
                                     if not attempt.get("error"):
                                         tracker.add(name, attempt.get("amount") or 0.0)
+                                    if not attempt.get("confirmed"):
+                                        state.setdefault("failed_loans", {})[str(attempt.get("loan_id"))] = time.time()
                                 pass_attempts.extend(attempts)
 
                         investment_attempts.extend(pass_attempts)
