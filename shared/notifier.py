@@ -143,7 +143,9 @@ def _swaper_failure_reason(attempt: dict) -> str:
     if attempt.get("error"):
         return "exception pendant la saisie du montant ou le clic sur « + »"
     if attempt.get("not_approved"):
-        return "investissement non approuvé par Swaper"
+        return ("investissement non approuvé par Swaper (is-manual-investment-approved = false) : "
+                "se connecter à Swaper et cocher « I accept the terms of Assignment Agreements » "
+                "dans le modal d'achat d'un prêt ; bot en pause")
     if not attempt.get("modal_html"):
         return "aucun modal de confirmation détecté après le clic sur « + »"
     if not attempt.get("confirmed"):

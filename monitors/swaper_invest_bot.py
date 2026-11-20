@@ -296,6 +296,11 @@ DRY_RUN = os.environ.get("SWAPER_BOT_MODE", "live").strip().lower() == "dry"
 # email each time - on every run, i.e. every couple of minutes while the balance is sufficient.
 FAILED_LOAN_COOLDOWN_SECONDS = float(os.environ.get("SWAPER_FAILED_LOAN_COOLDOWN_MINUTES", "360")) * 60
 
+# Swaper answers `false` to is-manual-investment-approved when the ACCOUNT isn't (or is no longer) allowed to
+# invest manually (seen 2026-11-20: Confirm stays disabled on every loan). That isn't loan-specific, so the
+# whole invest step is paused - one email per pause instead of one per run - until the account is fixed.
+APPROVAL_PAUSE_SECONDS = float(os.environ.get("SWAPER_NOT_APPROVED_PAUSE_MINUTES", "60")) * 60
+
 # Loans-listing page navigated to directly (fetch_loans() lets the real
 # Angular app fire the API call itself - see that function's docstring for
 # why a manually-built request gets 403).
@@ -847,6 +852,23 @@ def _extract_balance_from_attempts(attempts: list):
     return None
 
 
+def _manual_approval(captured_api_calls: list, start: int):
+    """Swaper's answer to `GET .../is-manual-investment-approved` among the calls captured since index `start`:
+    True / False, or None if it hasn't been seen (yet). `false` leaves the modal's Confirm button disabled."""
+    for call in reversed(captured_api_calls[start:]):
+        if call.get("method") == "GET" and "is-manual-investment-approved" in (call.get("url") or ""):
+            body = str(call.get("body") or "").strip().lower()
+            if body in ("true", "false"):
+                return body == "true"
+    return None
+
+
+def _approval_paused(state: dict) -> bool:
+    """True while the account-level "manual investment not approved" pause is running (see run())."""
+    paused_at = state.get("approval_paused_at")
+    return bool(paused_at) and time.time() - paused_at < APPROVAL_PAUSE_SECONDS
+
+
 def _active_failed_loans(state: dict) -> set:
     """Ids of the loans still in their cooldown after a failed purchase; expired entries are dropped from
     `state["failed_loans"]` (persisted with the rest of the state at the end of the run)."""
@@ -923,6 +945,7 @@ def _invest_loans_via_ui(page, loans: list, shares: dict, captured_api_calls: li
         row = row.first
 
         log.info("Investing %.2f EUR into loan %s (REAL money, real click).", amount, loan_label)
+        calls_before_click = len(captured_api_calls)
         try:
             amount_input = row.locator(".field.currency input").first
             amount_input.click()
@@ -966,6 +989,30 @@ def _invest_loans_via_ui(page, loans: list, shares: dict, captured_api_calls: li
             row_html_after_click = row.evaluate("el => el.outerHTML")
         except Exception:
             pass
+
+        if modal_html:
+            # The modal's Confirm button exists right away but stays disabled until Swaper's approval check
+            # answers; on `false` it never enables, so don't wait for a click that cannot succeed.
+            approved = None
+            for _ in range(20):
+                approved = _manual_approval(captured_api_calls, calls_before_click)
+                if approved is not None:
+                    break
+                page.wait_for_timeout(500)
+            if approved is False:
+                log.warning("Swaper says manual investing is not approved for this account (loan %s) - not confirming.", loan_label)
+                attempts.append({
+                    "loan_id": loan_id,
+                    "loan_number": loan.get("number"),
+                    "amount": amount,
+                    "rate": loan.get("interestRatePerYear"),
+                    "modal_html": modal_html,
+                    "row_html_after_click": row_html_after_click,
+                    "confirmed": False,
+                    "not_approved": True,
+                    "confirm_api_calls": captured_api_calls[calls_before_click:],
+                })
+                break
 
         confirmed = False
         confirm_api_calls = []
@@ -1277,6 +1324,11 @@ def run(headless: bool = True) -> None:
                                 "the actual auto-invest step.",
                                 budget_now, balance_now, config.keep_uninvested, MIN_INVESTMENT_AMOUNT,
                             )
+                        elif _approval_paused(state):
+                            log.info(
+                                "Swaper refused manual investing on a recent run (is-manual-investment-approved = false) - "
+                                "invest step paused until %d min after that run.", APPROVAL_PAUSE_SECONDS // 60,
+                            )
                         else:
                             # Per-country / per-originator caps ("Pourcentage max du
                             # solde par pays" / "par loan", relative to balance +
@@ -1373,11 +1425,19 @@ def run(headless: bool = True) -> None:
                                     # Caps are updated after every attempt that
                                     # wasn't an outright error, so later investments
                                     # in the same run see them.
-                                    if not attempt.get("error"):
+                                    if not attempt.get("error") and not attempt.get("not_approved"):
                                         tracker.add(name, attempt.get("amount") or 0.0)
                                     if not attempt.get("confirmed"):
                                         state.setdefault("failed_loans", {})[str(attempt.get("loan_id"))] = time.time()
                                 pass_attempts.extend(attempts)
+                                if any(a.get("not_approved") for a in attempts):
+                                    # Account-level refusal: no point trying the other originators, nor the next runs.
+                                    state["approval_paused_at"] = time.time()
+                                    log.warning(
+                                        "Manual investing not approved by Swaper - investing paused for %d min.",
+                                        APPROVAL_PAUSE_SECONDS // 60,
+                                    )
+                                    break
 
                         investment_attempts.extend(pass_attempts)
 
